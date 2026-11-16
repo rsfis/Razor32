@@ -7,20 +7,20 @@
 #include <WiFi.h>
 #include "time.h"
 
-//Keys Pins
-//y1   9
-//y2   21
-//y3   41
-//x1   48
-//x2   45
-//x3   17
-//x4   16
-//x5   40
-//x6   18
-//x7   42
-//x8   39
-//x9   47
-//x10  46
+//Keys Pins (matriz 3 linhas x 10 colunas)
+//Y1   8
+//Y2   21
+//Y3   41
+//X1   48
+//X2   45
+//X3   17
+//X4   16
+//X5   40
+//X6   18
+//X7   42
+//X8   39
+//X9   47
+//X10  7
 
 #define KERNEL_VERSION "ALPHA 0.2.6"
 
@@ -48,11 +48,14 @@
 #define LUA_OS_SAVE_SYSTEM_CONFIGURATION_DEFINITION "OS_SaveSystemConfig"
 #define LUA_OS_SAVE_USER_CONFIGURATION_DEFINITION "OS_SaveUserConfig"
 #define LUA_OS_SET_BIOS_CONFIG_INTEGER_KEY "OS_SetBiosConfigIntegerKey"
-#define LUA_OS_SET_BIOS_CONFIG_INTEGER_KEY "OS_SetBiosConfigStringKey"
+#define LUA_OS_SET_BIOS_CONFIG_STRING_KEY "OS_SetBiosConfigStringKey"
 #define LUA_OS_SET_SYSTEM_CONFIG_INTEGER_KEY "OS_SetSystemConfigIntegerKey"
-#define LUA_OS_SET_SYSTEM_CONFIG_INTEGER_KEY "OS_SetSystemConfigStringKey"
+#define LUA_OS_SET_SYSTEM_CONFIG_STRING_KEY "OS_SetSystemConfigStringKey"
 #define LUA_OS_SET_USER_CONFIG_INTEGER_KEY "OS_SetUserConfigIntegerKey"
-#define LUA_OS_SET_USER_CONFIG_INTEGER_KEY "OS_SetUserConfigStringKey"
+#define LUA_OS_SET_USER_CONFIG_STRING_KEY "OS_SetUserConfigStringKey"
+#define LUA_OS_SET_KEYBOARD_DELAY_DEFINITION "OS_SetKeyboardDelay"
+#define LUA_OS_GET_PRESSED_KEY_DEFINITION "OS_GetPressedKey"
+#define LUA_OS_IS_KEY_PRESSED_DEFINITION "OS_IsKeyPressed"
 
 const char* ntpServer = "pool.ntp.org";
 long gmtOffset_sec = -3 * 3600;  // UTC-3
@@ -647,9 +650,183 @@ int l_getUserPassword(lua_State* L){
   return 1;
 }
 
+// ===== KEYBOARD (matriz 3x10 + 3 camadas via FUNCTION) =====
+const int KB_ROWS = 3;
+const int KB_COLS = 10;
+
+const int kbRowPins[KB_ROWS] = {8, 21, 41};                           // Y1..Y3 (INPUT_PULLUP)
+const int kbColPins[KB_COLS] = {48, 45, 17, 16, 40, 18, 42, 39, 47, 7}; // X1..X10
+
+// Nomes exatamente como retornados por OS_GetPressedKey ("" = sem tecla)
+const char* const kbLayout[3][KB_ROWS][KB_COLS] = {
+  {
+    {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"},
+    {"A", "S", "D", "F", "G", "H", "J", "K", "L", "RETURN"},
+    {"Z", "X", "C", "V", "SPACE", "B", "N", "M", "FUNCTION", "ENTER"}
+  },
+  {
+    {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"},
+    {"CAPSLOCK", "?", "+", "-", "*", "=", "!", "(", ")", "RETURN"},
+    {"$", "/", "\"", "_", ".", ",", "{", "}", "fun", "ENTER"}
+  },
+  {
+    {"ESC", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9"},
+    {"@", ":", "|", "\\", "'", "-", "[", "]", "&", "RETURN"},
+    {"#", "HOME", "", "", "", "", "$", ";", "fun", "ENTER"}
+  }
+};
+
+bool kbMatrix[KB_ROWS][KB_COLS];       // [linha][coluna], true = pressionada
+uint8_t kbLayer = 0;                   // camada atual (0, 1 ou 2)
+bool kbCapsLock = false;                // CAPSLOCK ativo -> letras maiúsculas
+volatile uint32_t kbDelayMs = 300;     // delay global anti-flood (ms)
+uint32_t kbLastAcceptMs = 0;
+bool kbTimerStarted = false;
+
+void keyboardInit() {
+  for (int l = 0; l < KB_ROWS; l++) pinMode(kbRowPins[l], INPUT_PULLUP);
+  // Colunas começam em alta impedância
+  for (int c = 0; c < KB_COLS; c++) pinMode(kbColPins[c], INPUT);
+}
+
+// true quando o timer anti-flood já terminou (ou nunca foi iniciado)
+bool keyboardTimerReady() {
+  if (!kbTimerStarted) return true;
+  return (uint32_t)(millis() - kbLastAcceptMs) >= kbDelayMs;
+}
+
+void keyboardStartTimer() {
+  kbLastAcceptMs = millis();
+  kbTimerStarted = true;
+}
+
+void keyboardScan() {
+  for (int c = 0; c < KB_COLS; c++) {
+    pinMode(kbColPins[c], OUTPUT);
+    digitalWrite(kbColPins[c], LOW);
+    delayMicroseconds(5);
+
+    for (int l = 0; l < KB_ROWS; l++) {
+      kbMatrix[l][c] = (digitalRead(kbRowPins[l]) == LOW);
+    }
+
+    pinMode(kbColPins[c], INPUT);
+  }
+}
+
+// Posição física da tecla FUNCTION em cada camada
+bool keyboardIsFunctionCell(int layer, int l, int c) {
+  if (l != 2) return false;
+  return (layer == 0) ? (c == 8) : (c == 9);
+}
+
+// Se FUNCTION está pressionada: troca de camada (0 -> 1 -> 2 -> 0), inicia o timer
+// e retorna true (a tecla é consumida, não é reportada ao Lua).
+bool keyboardHandleFunction() {
+  for (int c = 0; c < KB_COLS; c++) {
+    if (keyboardIsFunctionCell(kbLayer, 2, c) && kbMatrix[2][c]) {
+      kbLayer = (kbLayer + 1) % 3;
+      keyboardStartTimer();
+      return true;
+    }
+  }
+
+  // CAPSLOCK (camada 1, linha 2, coluna 1): liga/desliga maiúsculas.
+  // Também é consumida e não é reportada ao Lua.
+  if (kbLayer == 1 && kbMatrix[1][0]) {
+    kbCapsLock = !kbCapsLock;
+    keyboardStartTimer();
+    return true;
+  }
+  return false;
+}
+
+// Letras são minúsculas por padrão; maiúsculas com CAPSLOCK ativo.
+// Teclas que não são uma única letra (números, símbolos, RETURN, F1...) ficam como estão.
+const char* keyboardApplyCase(const char* name, char* buf) {
+  if (name[0] != '\0' && name[1] == '\0' && isalpha((unsigned char)name[0])) {
+    buf[0] = kbCapsLock ? toupper((unsigned char)name[0]) : tolower((unsigned char)name[0]);
+    buf[1] = '\0';
+    return buf;
+  }
+  return name;
+}
+
+// OS_SetKeyboardDelay(ms) - delay global (em ms) entre teclas aceitas
+int l_OS_SetKeyboardDelay(lua_State* L) {
+  lua_Integer ms = luaL_checkinteger(L, 1);
+  if (ms < 0) ms = 0;
+  kbDelayMs = (uint32_t)ms;
+  return 0;
+}
+
+// OS_GetPressedKey() -> string | nil
+// Retorna o nome da tecla pressionada (apenas uma) ou nil se nenhuma / timer em andamento.
+int l_OS_GetPressedKey(lua_State* L) {
+  if (!keyboardTimerReady()) {
+    lua_pushnil(L);
+    return 1;
+  }
+
+  keyboardScan();
+
+  if (keyboardHandleFunction()) {
+    lua_pushnil(L);
+    return 1;
+  }
+
+  for (int l = 0; l < KB_ROWS; l++) {
+    for (int c = 0; c < KB_COLS; c++) {
+      const char* name = kbLayout[kbLayer][l][c];
+      if (name[0] != '\0' && kbMatrix[l][c]) {
+        keyboardStartTimer();
+        char caseBuf[2];
+        lua_pushstring(L, keyboardApplyCase(name, caseBuf));
+        return 1;
+      }
+    }
+  }
+
+  lua_pushnil(L);
+  return 1;
+}
+
+// OS_IsKeyPressed(key) -> boolean
+// true se a tecla pedida está pressionada (e o timer anti-flood permitiu a leitura).
+// O timer só é reiniciado quando a tecla pedida é a que foi detectada.
+int l_OS_IsKeyPressed(lua_State* L) {
+  const char* key = luaL_checkstring(L, 1);
+
+  if (!keyboardTimerReady()) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+
+  keyboardScan();
+
+  if (keyboardHandleFunction()) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+
+  for (int l = 0; l < KB_ROWS; l++) {
+    for (int c = 0; c < KB_COLS; c++) {
+      const char* name = kbLayout[kbLayer][l][c];
+      if (name[0] != '\0' && kbMatrix[l][c] && strcasecmp(name, key) == 0) {
+        keyboardStartTimer();
+        lua_pushboolean(L, 1);
+        return 1;
+      }
+    }
+  }
+
+  lua_pushboolean(L, 0);
+  return 1;
+}
+
 int l_OS_Sleep(lua_State* L){
   delay(luaL_checkinteger(L, 1));
-  return 1;
+  return 0;
 }
 
 int l_OS_Restart(lua_State* L){
@@ -1032,15 +1209,18 @@ void registerApis(lua_State* L) {
   lua_register(L, LUA_OS_SLEEP_DEFINITION, l_OS_Sleep);
   lua_register(L, LUA_OS_RESTART_DEFINITION, l_OS_Restart);
   lua_register(L, LUA_OS_GET_KERNEL_VERSION_DEFINITION, l_OS_GetKernelVersion);
+  lua_register(L, LUA_OS_SET_KEYBOARD_DELAY_DEFINITION, l_OS_SetKeyboardDelay);
+  lua_register(L, LUA_OS_GET_PRESSED_KEY_DEFINITION, l_OS_GetPressedKey);
+  lua_register(L, LUA_OS_IS_KEY_PRESSED_DEFINITION, l_OS_IsKeyPressed);
   lua_register(L, LUA_OS_SAVE_BIOS_CONFIGURATION_DEFINITION, l_OS_SaveBiosConfig);
   lua_register(L, LUA_OS_SAVE_SYSTEM_CONFIGURATION_DEFINITION, l_OS_SaveSystemConfig);
   lua_register(L, LUA_OS_SAVE_USER_CONFIGURATION_DEFINITION, l_OS_SaveUserConfig);
   lua_register(L, LUA_OS_SET_BIOS_CONFIG_INTEGER_KEY, l_OS_SetBiosConfigIntegerKey);
-  lua_register(L, LUA_OS_SET_BIOS_CONFIG_INTEGER_KEY, l_OS_SetBiosConfigStringKey);
+  lua_register(L, LUA_OS_SET_BIOS_CONFIG_STRING_KEY, l_OS_SetBiosConfigStringKey);
   lua_register(L, LUA_OS_SET_SYSTEM_CONFIG_INTEGER_KEY, l_OS_SetSystemConfigIntegerKey);
-  lua_register(L, LUA_OS_SET_SYSTEM_CONFIG_INTEGER_KEY, l_OS_SetSystemConfigStringKey);
+  lua_register(L, LUA_OS_SET_SYSTEM_CONFIG_STRING_KEY, l_OS_SetSystemConfigStringKey);
   lua_register(L, LUA_OS_SET_USER_CONFIG_INTEGER_KEY, l_OS_SetUserConfigIntegerKey);
-  lua_register(L, LUA_OS_SET_USER_CONFIG_INTEGER_KEY, l_OS_SetUserConfigStringKey);
+  lua_register(L, LUA_OS_SET_USER_CONFIG_STRING_KEY, l_OS_SetUserConfigStringKey);
   registerTime(L);
   registerSprite(L);
   registerFont(L);
@@ -1285,6 +1465,9 @@ void setup() {
   //saveSystemPreferences();
 
   // ONLY IF APP PRESENT:
+  keyboardInit();
+  Serial.printf("Keyboard Started\n");
+
   Serial.printf("Starting LUA VM\n");
 
   //pinMode(46, INPUT_PULLUP);
