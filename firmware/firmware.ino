@@ -650,7 +650,7 @@ int l_getUserPassword(lua_State* L){
   return 1;
 }
 
-// ===== KEYBOARD (matriz 3x10 + 3 camadas via FUNCTION) =====
+// ===== KEYBOARD (matriz 3x10 + 2 páginas; a 2ª muda com CAPSLOCK) =====
 const int KB_ROWS = 3;
 const int KB_COLS = 10;
 
@@ -658,6 +658,9 @@ const int kbRowPins[KB_ROWS] = {8, 21, 41};                           // Y1..Y3 
 const int kbColPins[KB_COLS] = {48, 45, 17, 16, 40, 18, 42, 39, 47, 7}; // X1..X10
 
 // Nomes exatamente como retornados por OS_GetPressedKey ("" = sem tecla)
+// Tabela 0: página 1
+// Tabela 1: página 2
+// Tabela 2: página 2 com CAPSLOCK ativo
 const char* const kbLayout[3][KB_ROWS][KB_COLS] = {
   {
     {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"},
@@ -666,22 +669,30 @@ const char* const kbLayout[3][KB_ROWS][KB_COLS] = {
   },
   {
     {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"},
-    {"CAPSLOCK", "?", "+", "-", "*", "=", "!", "(", ")", "RETURN"},
-    {"$", "/", "\"", "_", ".", ",", "{", "}", "fun", "ENTER"}
+    {"CAPSLOCK", "!", "?", "+", "-", "*", "=", "~", ":", "RETURN"},
+    {"$", "/", "\"", "(", ")", "@", ",", ".", "fun", "ENTER"}
   },
   {
     {"ESC", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9"},
-    {"@", ":", "|", "\\", "'", "-", "[", "]", "&", "RETURN"},
-    {"#", "HOME", "", "", "", "", "$", ";", "fun", "ENTER"}
+    {"", "", "", "", "", "", "", "", "", "RETURN"},
+    {"HOME", "", "", "[", "]", "", "", "", "fun", "ENTER"}
   }
 };
 
 bool kbMatrix[KB_ROWS][KB_COLS];       // [linha][coluna], true = pressionada
-uint8_t kbLayer = 0;                   // camada atual (0, 1 ou 2)
-bool kbCapsLock = false;                // CAPSLOCK ativo -> letras maiúsculas
+uint8_t kbLayer = 0;                   // página atual (0 ou 1)
+bool kbCapsLock = false;               // CAPSLOCK ativo -> letras maiúsculas
 volatile uint32_t kbDelayMs = 300;     // delay global anti-flood (ms)
 uint32_t kbLastAcceptMs = 0;
 bool kbTimerStarted = false;
+
+// Camada realmente usada em kbLayout:
+// página 0 -> tabela 0
+// página 1 -> tabela 1, ou tabela 2 se o CAPSLOCK estiver ativo
+uint8_t keyboardEffectiveLayer() {
+  if (kbLayer == 1 && kbCapsLock) return 2;
+  return kbLayer;
+}
 
 void keyboardInit() {
   for (int l = 0; l < KB_ROWS; l++) pinMode(kbRowPins[l], INPUT_PULLUP);
@@ -714,25 +725,26 @@ void keyboardScan() {
   }
 }
 
-// Posição física da tecla FUNCTION em cada camada
+// Posição física da tecla FUNCTION (a mesma em todas as páginas)
 bool keyboardIsFunctionCell(int layer, int l, int c) {
-  if (l != 2) return false;
-  return (layer == 0) ? (c == 8) : (c == 9);
+  (void)layer;
+  return (l == 2 && c == 8);
 }
 
-// Se FUNCTION está pressionada: troca de camada (0 -> 1 -> 2 -> 0), inicia o timer
+// Se FUNCTION está pressionada: alterna entre as duas páginas (0 <-> 1), inicia o timer
 // e retorna true (a tecla é consumida, não é reportada ao Lua).
 bool keyboardHandleFunction() {
   for (int c = 0; c < KB_COLS; c++) {
     if (keyboardIsFunctionCell(kbLayer, 2, c) && kbMatrix[2][c]) {
-      kbLayer = (kbLayer + 1) % 3;
+      kbLayer = (kbLayer + 1) % 2;
       keyboardStartTimer();
       return true;
     }
   }
 
-  // CAPSLOCK (camada 1, linha 2, coluna 1): liga/desliga maiúsculas.
-  // Também é consumida e não é reportada ao Lua.
+  // CAPSLOCK (página 1, linha 1, coluna 0): liga/desliga maiúsculas.
+  // Usa kbLayer (e não a camada efetiva), então continua funcionando
+  // com a terceira tabela ativa, permitindo desligar o CAPSLOCK.
   if (kbLayer == 1 && kbMatrix[1][0]) {
     kbCapsLock = !kbCapsLock;
     keyboardStartTimer();
@@ -777,7 +789,7 @@ int l_OS_GetPressedKey(lua_State* L) {
 
   for (int l = 0; l < KB_ROWS; l++) {
     for (int c = 0; c < KB_COLS; c++) {
-      const char* name = kbLayout[kbLayer][l][c];
+      const char* name = kbLayout[keyboardEffectiveLayer()][l][c];
       if (name[0] != '\0' && kbMatrix[l][c]) {
         keyboardStartTimer();
         char caseBuf[2];
@@ -811,7 +823,7 @@ int l_OS_IsKeyPressed(lua_State* L) {
 
   for (int l = 0; l < KB_ROWS; l++) {
     for (int c = 0; c < KB_COLS; c++) {
-      const char* name = kbLayout[kbLayer][l][c];
+      const char* name = kbLayout[keyboardEffectiveLayer()][l][c];
       if (name[0] != '\0' && kbMatrix[l][c] && strcasecmp(name, key) == 0) {
         keyboardStartTimer();
         lua_pushboolean(L, 1);
