@@ -5,6 +5,7 @@
 #include <SD.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
+#include <NimBLEDevice.h>
 #include "time.h"
 
 //Keys Pins (matriz 3 linhas x 10 colunas)
@@ -56,6 +57,12 @@
 #define LUA_OS_SET_KEYBOARD_DELAY_DEFINITION "OS_SetKeyboardDelay"
 #define LUA_OS_GET_PRESSED_KEY_DEFINITION "OS_GetPressedKey"
 #define LUA_OS_IS_KEY_PRESSED_DEFINITION "OS_IsKeyPressed"
+#define LUA_OS_HAS_MOUSE_CONNECTED_DEFINITION "OS_HasMouseConnected"
+#define LUA_OS_GET_MOUSE_POSITION_DEFINITION "OS_GetMousePosition"
+#define LUA_OS_IS_MOUSE1_PRESSED_DEFINITION "OS_IsMouse1Pressed"
+#define LUA_OS_IS_MOUSE2_PRESSED_DEFINITION "OS_IsMouse2Pressed"
+#define LUA_OS_GET_MOUSE_SCROLL_DELTA_DEFINITION "OS_GetMouseScrollDelta"
+#define LUA_OS_UPDATE_MOUSE_TASK_DEFINITION "OS_UpdateMouseTask"
 
 const char* ntpServer = "pool.ntp.org";
 long gmtOffset_sec = -3 * 3600;  // UTC-3
@@ -650,6 +657,269 @@ int l_getUserPassword(lua_State* L){
   return 1;
 }
 
+// MOUSE SUPPORT
+// ===== MOUSE BLUETOOTH (BLE HID) =====
+#define BLE_MOUSE_DEBUG 0              // 1 = imprime no Serial os bytes que o mouse manda
+#define BLE_FORCE_BOOT_PROTOCOL 0      // 1 = pede o formato simples "boot" (alguns mouses não aceitam)
+#define BLE_MOUSE_NAME ""              // opcional: parte do nome do mouse pra forçar a escolha
+
+portMUX_TYPE mouseMux = portMUX_INITIALIZER_UNLOCKED;
+
+int  mouseX = 240;                 // começa no centro (480x320)
+int  mouseY = 160;
+bool mouseBtn1 = false;            // esquerdo
+bool mouseBtn2 = false;            // direito
+int  mouseScroll = 0;              // acumulado desde a última leitura
+volatile bool mouseConnected = false;
+
+static NimBLEClient* bleClient = nullptr;
+static NimBLEAddress bleTargetAddr;
+static volatile bool bleFound = false;
+static volatile bool bleDisconnected = false;
+
+// Chega um relatório do mouse
+static void bleMouseNotify(NimBLERemoteCharacteristic* chr, uint8_t* d, size_t len, bool isNotify) {
+#if BLE_MOUSE_DEBUG
+  Serial.printf("[BLE] report (%s) len %d:", chr->getUUID().toString().c_str(), (int)len);
+  for (size_t i = 0; i < len; i++) Serial.printf(" %02X", d[i]);
+  Serial.println();
+#endif
+
+  int btn = 0, dx = 0, dy = 0, wh = 0;
+
+  if (len == 3 || len == 4) {
+    // Boot protocol: [botões][dx][dy][wheel]
+    btn = d[0];
+    dx = (int8_t)d[1];
+    dy = (int8_t)d[2];
+    if (len == 4) wh = (int8_t)d[3];
+  } else if (len == 6 || len == 7) {
+    // Formato comum com 16 bits: [botões][x lo][x hi][y lo][y hi][wheel]...
+    btn = d[0];
+    dx = (int16_t)(d[1] | (d[2] << 8));
+    dy = (int16_t)(d[3] | (d[4] << 8));
+    wh = (int8_t)d[5];
+  } else {
+    return;   // formato desconhecido: só o log acima
+  }
+
+  portENTER_CRITICAL(&mouseMux);
+
+  mouseBtn1 = (btn & 0x01) != 0;
+  mouseBtn2 = (btn & 0x02) != 0;
+
+  mouseX += dx;
+  mouseY += dy;   // y positivo = pra baixo, igual à tela
+
+  if (mouseX < 0) mouseX = 0;
+  if (mouseY < 0) mouseY = 0;
+  if (mouseX > tft.width()  - 1) mouseX = tft.width()  - 1;
+  if (mouseY > tft.height() - 1) mouseY = tft.height() - 1;
+
+  mouseScroll += wh;
+
+  portEXIT_CRITICAL(&mouseMux);
+}
+
+class MouseClientCb : public NimBLEClientCallbacks {
+  void onDisconnect(NimBLEClient* c, int reason) override {
+    bleDisconnected = true;
+  }
+};
+static MouseClientCb bleClientCb;
+
+class MouseScanCb : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* dev) override {
+    if (bleFound) return;
+
+    std::string name = dev->getName();
+    bool hasHid = dev->isAdvertisingService(NimBLEUUID((uint16_t)0x1812));
+    uint16_t app = dev->haveAppearance() ? dev->getAppearance() : 0;
+
+    bool match = false;
+    if (strlen(BLE_MOUSE_NAME) > 0) {
+      match = (name.find(BLE_MOUSE_NAME) != std::string::npos);
+    } else {
+      // Mouse pela aparência, ou qualquer HID que não seja teclado
+      match = (app == 0x03C2) || (app == 0x03C0) || (hasHid && app != 0x03C1);
+    }
+    if (!match) return;
+
+    bleTargetAddr = dev->getAddress();
+    bleFound = true;
+    Serial.printf("[BLE] Mouse candidate: '%s' (%s)\n",
+                  name.c_str(), dev->getAddress().toString().c_str());
+    NimBLEDevice::getScan()->stop();
+  }
+};
+static MouseScanCb bleScanCb;
+
+static bool bleConnectMouse() {
+  if (!bleClient) {
+    bleClient = NimBLEDevice::createClient();
+    bleClient->setClientCallbacks(&bleClientCb, false);
+    bleClient->setConnectTimeout(8000);   // ms
+  }
+
+  bleDisconnected = false;
+
+  if (!bleClient->connect(bleTargetAddr)) {
+    Serial.println("[BLE] Connect failed");
+    return false;
+  }
+
+  // Pareamento/criptografia (HID exige). O pareamento fica salvo na NVS.
+  if (!bleClient->secureConnection()) {
+    Serial.println("[BLE] Secure connection failed");
+    bleClient->disconnect();
+    return false;
+  }
+
+  NimBLERemoteService* hid = bleClient->getService(NimBLEUUID((uint16_t)0x1812));
+  if (!hid) {
+    Serial.println("[BLE] HID service not found");
+    bleClient->disconnect();
+    return false;
+  }
+
+#if BLE_FORCE_BOOT_PROTOCOL
+  // Pede o "boot protocol" (formato simples de 3-4 bytes)
+  NimBLERemoteCharacteristic* proto = hid->getCharacteristic(NimBLEUUID((uint16_t)0x2A4E));
+  if (proto && proto->canWriteNoResponse()) {
+    uint8_t boot = 0;
+    proto->writeValue(&boot, 1, false);
+  }
+#endif
+
+  // Assina o relatório boot (0x2A33) e todos os relatórios normais (0x2A4D)
+  int subs = 0;
+  for (auto chr : hid->getCharacteristics(true)) {
+    NimBLEUUID u = chr->getUUID();
+    if (u == NimBLEUUID((uint16_t)0x2A33) || u == NimBLEUUID((uint16_t)0x2A4D)) {
+      if (chr->canNotify() && chr->subscribe(true, bleMouseNotify)) {
+        subs++;
+        Serial.printf("[BLE] subscribed to %s\n", u.toString().c_str());
+      }
+    }
+  }
+
+  if (subs == 0) {
+    Serial.println("[BLE] No report characteristic to subscribe");
+    bleClient->disconnect();
+    return false;
+  }
+
+  portENTER_CRITICAL(&mouseMux);
+  mouseScroll = 0;
+  portEXIT_CRITICAL(&mouseMux);
+
+  mouseConnected = true;
+  Serial.println("[BLE] Mouse connected");
+  return true;
+}
+
+// Task de fundo: procura o mouse, conecta e reconecta se cair
+static void bleMouseTask(void* arg) {
+  NimBLEDevice::init("RazorOS");
+  NimBLEDevice::setSecurityAuth(true, false, true);               // bonding, sem MITM, Secure Connections
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);      // "Just Works"
+
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  scan->setScanCallbacks(&bleScanCb, false);
+  scan->setActiveScan(true);
+  scan->setInterval(100);
+  scan->setWindow(99);
+
+  for (;;) {
+    if (mouseConnected) {
+      if (bleDisconnected || !bleClient || !bleClient->isConnected()) {
+        mouseConnected = false;
+        portENTER_CRITICAL(&mouseMux);
+        mouseBtn1 = false;
+        mouseBtn2 = false;
+        mouseScroll = 0;
+        portEXIT_CRITICAL(&mouseMux);
+        Serial.println("[BLE] Mouse disconnected");
+      }
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+
+    bleFound = false;
+    scan->start(5000, false);                // 5 s, não bloqueia
+
+    uint32_t t0 = millis();
+    while (!bleFound && (millis() - t0) < 6000) vTaskDelay(pdMS_TO_TICKS(50));
+    scan->stop();
+
+    if (bleFound) {
+      bleConnectMouse();
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+void bleMouseBegin() {
+  xTaskCreatePinnedToCore(bleMouseTask, "BLE_MOUSE", 8192, NULL, 1, NULL, 0);
+  Serial.println("BLE Mouse task started");
+}
+
+// OS_UpdateMouseTask()
+// Não é mais necessário (o BLE roda numa task própria), mas fica exportada
+// pra não quebrar os apps Lua que já chamam essa função.
+int l_OS_UpdateMouseTask(lua_State* L) {
+  return 0;
+}
+
+// OS_HasMouseConnected() -> boolean
+int l_OS_HasMouseConnected(lua_State* L) {
+  lua_pushboolean(L, mouseConnected);
+  return 1;
+}
+
+// OS_GetMousePosition() -> { x, y }
+int l_OS_GetMousePosition(lua_State* L) {
+  portENTER_CRITICAL(&mouseMux);
+  int x = mouseX;
+  int y = mouseY;
+  portEXIT_CRITICAL(&mouseMux);
+
+  lua_createtable(L, 2, 0);
+  lua_pushinteger(L, x);
+  lua_rawseti(L, -2, 1);
+  lua_pushinteger(L, y);
+  lua_rawseti(L, -2, 2);
+  return 1;
+}
+
+// OS_IsMouse1Pressed() -> boolean (esquerdo)
+int l_OS_IsMouse1Pressed(lua_State* L) {
+  portENTER_CRITICAL(&mouseMux);
+  bool b = mouseBtn1;
+  portEXIT_CRITICAL(&mouseMux);
+  lua_pushboolean(L, b);
+  return 1;
+}
+
+// OS_IsMouse2Pressed() -> boolean (direito)
+int l_OS_IsMouse2Pressed(lua_State* L) {
+  portENTER_CRITICAL(&mouseMux);
+  bool b = mouseBtn2;
+  portEXIT_CRITICAL(&mouseMux);
+  lua_pushboolean(L, b);
+  return 1;
+}
+
+// OS_GetMouseScrollDelta() -> integer (acumulado desde a última chamada; zera ao ler)
+int l_OS_GetMouseScrollDelta(lua_State* L) {
+  portENTER_CRITICAL(&mouseMux);
+  int s = mouseScroll;
+  mouseScroll = 0;
+  portEXIT_CRITICAL(&mouseMux);
+  lua_pushinteger(L, s);
+  return 1;
+}
+
 // ===== KEYBOARD (matriz 3x10 + 2 páginas; a 2ª muda com CAPSLOCK) =====
 const int KB_ROWS = 3;
 const int KB_COLS = 10;
@@ -1236,6 +1506,12 @@ void registerApis(lua_State* L) {
   registerTime(L);
   registerSprite(L);
   registerFont(L);
+  lua_register(L, LUA_OS_HAS_MOUSE_CONNECTED_DEFINITION, l_OS_HasMouseConnected);
+  lua_register(L, LUA_OS_GET_MOUSE_POSITION_DEFINITION, l_OS_GetMousePosition);
+  lua_register(L, LUA_OS_IS_MOUSE1_PRESSED_DEFINITION, l_OS_IsMouse1Pressed);
+  lua_register(L, LUA_OS_IS_MOUSE2_PRESSED_DEFINITION, l_OS_IsMouse2Pressed);
+  lua_register(L, LUA_OS_GET_MOUSE_SCROLL_DELTA_DEFINITION, l_OS_GetMouseScrollDelta);
+  lua_register(L, LUA_OS_UPDATE_MOUSE_TASK_DEFINITION, l_OS_UpdateMouseTask);
 }
 
 // ===== Task Lua (Core 1) =====
@@ -1468,7 +1744,7 @@ void setup() {
   userConfigFile.close();
   Serial.printf("Loaded /usr/sys/user.json user configs\n");
 
-  // TEST
+  // EXAMPLE
   //BiosConfiguration["TestScreenColorsWhenStartingUp"] = true;
   //UserConfiguration["username"] = "rsfiscina";
   //SystemConfiguration["Time"]["timezone"] = -4;
@@ -1480,15 +1756,10 @@ void setup() {
   keyboardInit();
   Serial.printf("Keyboard Started\n");
 
-  Serial.printf("Starting LUA VM\n");
+  bleMouseBegin();
+  Serial.printf("USB Host Started\n");
 
-  //pinMode(46, INPUT_PULLUP);
-  //int buttonState = digitalRead(46);
-  //if (buttonState == LOW) {
-  //  Serial.println("Button: PRESSED");
-  //} else {
-  //  Serial.println("Button: Released");
-  //}
+  Serial.printf("Starting LUA VM\n");
 
   xTaskCreatePinnedToCore(
     taskLuaApp,
