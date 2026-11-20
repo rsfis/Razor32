@@ -1847,12 +1847,12 @@ const char* const kbLayout[3][KB_ROWS][KB_COLS] = {
   {
     {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"},
     {"CAPSLOCK", "!", "?", "+", "-", "*", "=", "~", ":", "RETURN"},
-    {"$", "/", "\"", "(", ")", "@", ",", ".", "fun", "ENTER"}
+    {"%", "/", "\"", "(", ")", "^", ",", ".", "fun", "ENTER"}
   },
   {
     {"ESC", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9"},
-    {"CAPSLOCK", "", "", "", "", "", "WifiToggle", "BluetoothToggle", "", "RETURN"},
-    {"HOME", "", "", "[", "]", "", "", "", "fun", "ENTER"}
+    {"CAPSLOCK", "@", "$", "", "", "", "WifiToggle", "BluetoothToggle", "", "RETURN"},
+    {"HOME", "", "", "[", "]", "<", ">", "", "fun", "ENTER"}
   }
 };
 
