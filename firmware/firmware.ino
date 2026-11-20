@@ -5,6 +5,8 @@
 #include <SD.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
+#include <algorithm>
 #include <NimBLEDevice.h>
 #include "time.h"
 #include <vector>
@@ -72,13 +74,29 @@
 #define LUA_OS_UPDATE_MOUSE_TASK_DEFINITION "OS_UpdateMouseTask"
 #define LUA_OS_IS_WIFI_ENABLED_DEFINITION "OS_IsWifiEnabled"
 #define LUA_OS_IS_BLUETOOTH_ENABLED_DEFINITION "OS_IsBluetoothEnabled"
+#define LUA_OS_ENABLE_WIFI_DEFINITION "OS_EnableWifi"
+#define LUA_OS_DISABLE_WIFI_DEFINITION "OS_DisableWifi"
+#define LUA_OS_ENABLE_BLUETOOTH_DEFINITION "OS_EnableBluetooth"
+#define LUA_OS_GET_CONNECTED_BLUETOOTH_NAME_DEFINITION "OS_GetConnectedBluetoothName"
+#define LUA_OS_DISABLE_BLUETOOTH_DEFINITION "OS_DisableBluetooth"
+#define LUA_DISPLAY_DRAW_RECT_DEFINITION "Display_DrawRect"
+#define LUA_DISPLAY_DRAW_ELIPSE_DEFINITION "Display_DrawElipse"
+#define LUA_DISPLAY_DRAW_ARC_DEFINITION "Display_DrawArc"
+#define LUA_OS_GET_FOUND_WIFI_NETWORKS_DEFINITION "OS_GetFoundWifiNetworks"
+#define LUA_OS_FORGET_WIFI_DEFINITION "OS_ForgetWifi"
+#define LUA_OS_CONNECT_WIFI_DEFINITION "OS_ConnectWifi"
+#define LUA_OS_GET_WIFI_STATUS_DEFINITION "OS_GetWifiStatus"
+#define LUA_OS_GET_CONNECTED_WIFI_SSID_DEFINITION "OS_GetConnectedWifiSSID"
+#define LUA_OS_IS_WIFI_SCANNING_DEFINITION "OS_IsWifiScanning"
+#define LUA_DISPLAY_DRAW_POLIGON_DEFINITION "Display_DrawPoligon"
+#define LUA_DISPLAY_DRAW_LINE_DEFINITION "Display_DrawLine"
 
 // ===== WIFI / BLUETOOTH TOGGLE =====
 // Nomes das teclas no kbLayout (tratadas só pelo kernel, o Lua nunca recebe elas)
 #define KEY_WIFI_TOGGLE "WifiToggle"
 #define KEY_BLUETOOTH_TOGGLE "BluetoothToggle"
 #define TOGGLE_KEY_COOLDOWN_MS 2000   // timer de utilização das duas teclas
-#define KERNEL_KEY_DEBUG 1            // 1 = imprime no Serial as teclas que o kernel vê (pra diagnóstico)
+#define KERNEL_KEY_DEBUG 0            // 1 = imprime no Serial as teclas que o kernel vê (pra diagnóstico)
 #define TOAST_DURATION_MS 1500        // tempo da notificação rápida na tela
 
 const char* ntpServer = "pool.ntp.org";
@@ -90,6 +108,22 @@ StaticJsonDocument<1024> SystemConfiguration;
 StaticJsonDocument<1024> UserConfiguration;
 
 struct Sprite;
+
+// Estilo das formas básicas (Display_DrawRect / Display_DrawElipse).
+// Definido aqui no topo pra já existir quando a IDE gerar os protótipos das funções.
+struct ShapeStyle {
+  bool hasFill = false;
+  bool hasBorder = false;
+  uint16_t fill = 0;
+  uint16_t border = 0;
+  int bw = 0;            // espessura da borda (px)
+};
+
+#define SHAPE_DEG2RAD 0.017453292f
+#define SHAPE_POLY_MAX 64          // máximo de vértices em Display_DrawPoligon
+#define SHAPE_JOIN_MITER 0         // quina pontuda (vira bevel se o ângulo for muito fechado)
+#define SHAPE_JOIN_BEVEL 1         // quina cortada
+#define SHAPE_JOIN_ROUND 2         // quina arredondada
 
 // ===== KERNEL SERVICES (forward declarations) =====
 void kernelLuaCheckpoint();                 // ponto onde a task Lua pode ser pausada pelo kernel
@@ -566,6 +600,755 @@ int l_updateScreen(lua_State* L){
   return 0;
 }
 
+// ===== SHAPES: Display_DrawRect / Display_DrawElipse / Display_DrawArc =====
+// Rasterizadas em scanlines direto no 'frame' (sem anti-alias) e reportadas ao
+// dirty-rect tracker. Cores são tabelas Lua {r, g, b} (0-255).
+
+static inline int shpMin(int a, int b) { return a < b ? a : b; }
+static inline int shpMax(int a, int b) { return a > b ? a : b; }
+static inline int shpClamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+static inline int shapeArgInt(lua_State* L, int idx) {
+  return (int)lroundf((float)luaL_checknumber(L, idx));
+}
+
+// true se existe uma tabela de opções nessa posição (nil/ausente = sem opções)
+static bool shapeHasOpts(lua_State* L, int idx) {
+  if (lua_isnoneornil(L, idx)) return false;
+  luaL_checktype(L, idx, LUA_TTABLE);
+  return true;
+}
+
+// Lê opts[field] = {r, g, b}. 'idx' precisa ser um índice absoluto (positivo).
+static bool shapeReadColor(lua_State* L, int idx, const char* field, uint16_t& out) {
+  lua_getfield(L, idx, field);
+  if (!lua_istable(L, -1)) {
+    lua_pop(L, 1);
+    return false;
+  }
+  int c[3] = {0, 0, 0};
+  for (int i = 0; i < 3; i++) {
+    lua_rawgeti(L, -1, i + 1);
+    c[i] = shpClamp((int)lua_tonumber(L, -1), 0, 255);
+    lua_pop(L, 1);
+  }
+  lua_pop(L, 1);
+  out = tft.color565(c[0], c[1], c[2]);
+  return true;
+}
+
+static int shapeReadInt(lua_State* L, int idx, const char* field, int def) {
+  lua_getfield(L, idx, field);
+  int v = def;
+  if (lua_isnumber(L, -1)) v = (int)lroundf((float)lua_tonumber(L, -1));
+  lua_pop(L, 1);
+  return v;
+}
+
+static bool shapeReadBool(lua_State* L, int idx, const char* field, bool def) {
+  lua_getfield(L, idx, field);
+  bool v = lua_isnil(L, -1) ? def : (lua_toboolean(L, -1) != 0);
+  lua_pop(L, 1);
+  return v;
+}
+
+// defaultFill: true = sem nenhuma cor nas opções, preenche de branco;
+//              false = sem nenhuma cor nas opções, usa uma borda branca de 1 px
+static void shapeReadStyle(lua_State* L, int idx, bool hasOpts, int maxBorder, bool defaultFill, ShapeStyle& st) {
+  st = ShapeStyle();
+  if (hasOpts) {
+    st.hasFill = shapeReadColor(L, idx, "fill", st.fill);
+    st.hasBorder = shapeReadColor(L, idx, "border", st.border);
+    if (st.hasBorder) {
+      st.bw = shpClamp(shapeReadInt(L, idx, "borderWidth", 1), 0, maxBorder);
+      if (st.bw == 0) st.hasBorder = false;
+    }
+  }
+  // Sem nenhuma opção de cor: padrão branco
+  if (!st.hasFill && !st.hasBorder) {
+    if (defaultFill) {
+      st.hasFill = true;
+      st.fill = tft.color565(255, 255, 255);
+    } else {
+      st.hasBorder = true;
+      st.border = tft.color565(255, 255, 255);
+      st.bw = 1;
+    }
+  }
+}
+
+static inline void shapeHLine(int x1, int x2, int y, uint16_t color) {
+  if (x2 < x1) return;
+  frame.drawFastHLine(x1, y, x2 - x1 + 1, color);
+}
+
+// ----- Retângulo (raios por canto: 0=TL, 1=TR, 2=BR, 3=BL) -----
+// Intervalo [l, r] (coords locais) ocupado pela linha j de um retângulo w x h com cantos arredondados
+static void shapeRectRowSpan(int w, int h, const int rad[4], int j, int& l, int& r) {
+  l = 0;
+  r = w - 1;
+  const float jc = j + 0.5f;
+
+  for (int k = 0; k < 4; k++) {
+    int rd = rad[k];
+    if (rd <= 0) continue;
+
+    float dy;
+    if (k == 0 || k == 1) {            // cantos de cima
+      if (j >= rd) continue;
+      dy = rd - jc;
+    } else {                           // cantos de baixo
+      if (j < h - rd) continue;
+      dy = jc - (h - rd);
+    }
+
+    float dx2 = (float)rd * rd - dy * dy;
+    float dx = dx2 > 0 ? sqrtf(dx2) : 0.0f;
+    int inset = (int)ceilf(rd - 0.5f - dx);
+    if (inset < 0) inset = 0;
+
+    if (k == 0 || k == 3) l = shpMax(l, inset);        // TL, BL
+    else                  r = shpMin(r, w - 1 - inset); // TR, BR
+  }
+}
+
+static void shapeDrawRoundedRect(int x, int y, int w, int h, int rad[4], const ShapeStyle& st) {
+  const int maxR = shpMin(w, h) / 2;
+  for (int k = 0; k < 4; k++) rad[k] = shpClamp(rad[k], 0, maxR);
+
+  const int bw = st.hasBorder ? st.bw : 0;
+  const int iw = w - 2 * bw;
+  const int ih = h - 2 * bw;
+
+  int irad[4];
+  const int imaxR = shpMax(0, shpMin(iw, ih) / 2);
+  for (int k = 0; k < 4; k++) irad[k] = shpClamp(rad[k] - bw, 0, imaxR);
+
+  const int fh = (int)frame.height();
+  const int j0 = shpMax(0, -y);
+  const int j1 = shpMin(h, fh - y);
+
+  for (int j = j0; j < j1; j++) {
+    int ol, orr;
+    shapeRectRowSpan(w, h, rad, j, ol, orr);
+    ol += x;
+    orr += x;
+    const int py = y + j;
+
+    if (bw == 0) {
+      shapeHLine(ol, orr, py, st.fill);
+      continue;
+    }
+
+    const int jin = j - bw;
+    bool hasInner = (iw > 0 && ih > 0 && jin >= 0 && jin < ih);
+    int il = 0, ir = 0;
+    if (hasInner) {
+      shapeRectRowSpan(iw, ih, irad, jin, il, ir);
+      il = shpMax(il + x + bw, ol);
+      ir = shpMin(ir + x + bw, orr);
+      if (ir < il) hasInner = false;
+    }
+
+    if (!hasInner) {
+      shapeHLine(ol, orr, py, st.border);
+    } else {
+      shapeHLine(ol, il - 1, py, st.border);
+      shapeHLine(ir + 1, orr, py, st.border);
+      if (st.hasFill) shapeHLine(il, ir, py, st.fill);
+    }
+  }
+}
+
+// ----- Elipse (centro cx,cy; ocupa [cx-rx, cx+rx) x [cy-ry, cy+ry)) -----
+static bool shapeEllipseRowSpan(int rx, int ry, int j, int& l, int& r) {
+  const float py = (j + 0.5f) - ry;
+  const float t = 1.0f - (py * py) / ((float)ry * ry);
+  if (t < 0.0f) return false;
+  const float half = rx * sqrtf(t);
+  l = (int)ceilf(rx - 0.5f - half);
+  r = (int)floorf(rx - 0.5f + half);
+  return r >= l;
+}
+
+static void shapeDrawEllipse(int cx, int cy, int rx, int ry, const ShapeStyle& st) {
+  const int bw = st.hasBorder ? st.bw : 0;
+  const int left = cx - rx;
+  const int top = cy - ry;
+  const int irx = rx - bw;
+  const int iry = ry - bw;
+
+  const int fh = (int)frame.height();
+  const int j0 = shpMax(0, -top);
+  const int j1 = shpMin(2 * ry, fh - top);
+
+  for (int j = j0; j < j1; j++) {
+    int ol, orr;
+    if (!shapeEllipseRowSpan(rx, ry, j, ol, orr)) continue;
+    ol += left;
+    orr += left;
+    const int py = top + j;
+
+    if (bw == 0) {
+      shapeHLine(ol, orr, py, st.fill);
+      continue;
+    }
+
+    const int jin = j - bw;
+    bool hasInner = (irx > 0 && iry > 0 && jin >= 0 && jin < 2 * iry);
+    int il = 0, ir = 0;
+    if (hasInner) {
+      hasInner = shapeEllipseRowSpan(irx, iry, jin, il, ir);
+      if (hasInner) {
+        il = shpMax(il + left + bw, ol);
+        ir = shpMin(ir + left + bw, orr);
+        if (ir < il) hasInner = false;
+      }
+    }
+
+    if (!hasInner) {
+      shapeHLine(ol, orr, py, st.border);
+    } else {
+      shapeHLine(ol, il - 1, py, st.border);
+      shapeHLine(ir + 1, orr, py, st.border);
+      if (st.hasFill) shapeHLine(il, ir, py, st.fill);
+    }
+  }
+}
+
+// ----- Arco -----
+// Ângulos em graus, sentido horário, 0° = 12 horas (topo), 90° = 3 horas...
+// Anel entre rin e R (rin = 0 vira "fatia de pizza"). Centro no canto do pixel (cx, cy).
+static void shapeDrawArc(int cx, int cy, int R, int rin, float startDeg, float sweepDeg, bool full, uint16_t color) {
+  const float a0 = startDeg * SHAPE_DEG2RAD;
+  const float a1 = (startDeg + sweepDeg) * SHAPE_DEG2RAD;
+  const float sx = sinf(a0), sy = -cosf(a0);   // direção inicial (y da tela cresce pra baixo)
+  const float ex = sinf(a1), ey = -cosf(a1);   // direção final
+  const bool small = (sweepDeg <= 180.0f);
+
+  const float R2 = (float)R * R;
+  const float rin2 = (float)rin * rin;
+  const int fw = (int)frame.width();
+  const int fh = (int)frame.height();
+
+  const int y0 = shpMax(cy - R, 0);
+  const int y1 = shpMin(cy + R, fh);
+
+  for (int y = y0; y < y1; y++) {
+    const float py = y + 0.5f - cy;
+    const float t = R2 - py * py;
+    if (t <= 0.0f) continue;
+
+    const float half = sqrtf(t);
+    const int xs = shpMax((int)ceilf(cx - 0.5f - half), 0);
+    const int xe = shpMin((int)floorf(cx - 0.5f + half), fw - 1);
+    if (xe < xs) continue;
+
+    // Varre [xa, xb], desenhando só os trechos que estão dentro do ângulo
+    auto scan = [&](int xa, int xb) {
+      int run = -1;
+      for (int x = xa; x <= xb; x++) {
+        const float px = x + 0.5f - cx;
+        bool in = true;
+        if (!full) {
+          const float cs = sx * py - sy * px;   // produto vetorial (início, ponto)
+          const float ce = px * ey - py * ex;   // produto vetorial (ponto, fim)
+          in = small ? (cs >= 0.0f && ce >= 0.0f) : !(cs < 0.0f && ce < 0.0f);
+        }
+        if (in) {
+          if (run < 0) run = x;
+        } else if (run >= 0) {
+          frame.drawFastHLine(run, y, x - run, color);
+          run = -1;
+        }
+      }
+      if (run >= 0) frame.drawFastHLine(run, y, xb - run + 1, color);
+    };
+
+    if (rin > 0 && py * py < rin2) {
+      // Pula o buraco do meio do anel
+      const float hh = sqrtf(rin2 - py * py);
+      const int hs = (int)floorf(cx - 0.5f - hh) + 1;
+      const int he = (int)ceilf(cx - 0.5f + hh) - 1;
+      scan(xs, shpMin(hs - 1, xe));
+      scan(shpMax(he + 1, xs), xe);
+    } else {
+      scan(xs, xe);
+    }
+  }
+}
+
+// Display_DrawRect(x, y, w, h [, opts])
+// opts: fill={r,g,b}, border={r,g,b}, borderWidth=n (padrão 1),
+//       radius=n (todos os cantos), radiusTL / radiusTR / radiusBR / radiusBL (por canto)
+// Sem fill e sem border: preenche de branco. Raio grande (>= min(w,h)/2) vira "pílula".
+int l_drawRect(lua_State* L) {
+  const int x = shapeArgInt(L, 1);
+  const int y = shapeArgInt(L, 2);
+  const int w = shapeArgInt(L, 3);
+  const int h = shapeArgInt(L, 4);
+  const bool hasOpts = shapeHasOpts(L, 5);
+
+  if (w <= 0 || h <= 0) return 0;
+
+  ShapeStyle st;
+  shapeReadStyle(L, 5, hasOpts, shpMin(w, h) / 2, true, st);
+
+  int rad[4] = {0, 0, 0, 0};
+  if (hasOpts) {
+    const int base = shapeReadInt(L, 5, "radius", 0);
+    rad[0] = shapeReadInt(L, 5, "radiusTL", base);
+    rad[1] = shapeReadInt(L, 5, "radiusTR", base);
+    rad[2] = shapeReadInt(L, 5, "radiusBR", base);
+    rad[3] = shapeReadInt(L, 5, "radiusBL", base);
+  }
+
+  shapeDrawRoundedRect(x, y, w, h, rad, st);
+  markDirty(x, y, w, h);
+  return 0;
+}
+
+// Display_DrawElipse(cx, cy, rx, ry [, opts])   (cx, cy = centro)
+// opts: fill={r,g,b}, border={r,g,b}, borderWidth=n (padrão 1)
+// rx == ry desenha um círculo.
+int l_drawElipse(lua_State* L) {
+  const int cx = shapeArgInt(L, 1);
+  const int cy = shapeArgInt(L, 2);
+  const int rx = shapeArgInt(L, 3);
+  const int ry = shapeArgInt(L, 4);
+  const bool hasOpts = shapeHasOpts(L, 5);
+
+  if (rx <= 0 || ry <= 0) return 0;
+
+  ShapeStyle st;
+  shapeReadStyle(L, 5, hasOpts, shpMin(rx, ry), true, st);
+
+  shapeDrawEllipse(cx, cy, rx, ry, st);
+  markDirty(cx - rx, cy - ry, 2 * rx, 2 * ry);
+  return 0;
+}
+
+// Display_DrawArc(cx, cy, radius, startAngle, endAngle [, opts])
+// Ângulos em graus, sempre no sentido horário de startAngle até endAngle; 0° = topo.
+// |end - start| >= 360 desenha o anel completo.
+// opts: color={r,g,b} (padrão branco), thickness=n (padrão 1, para dentro a partir de radius),
+//       pie=true (fatia preenchida até o centro), roundCaps=true (pontas arredondadas),
+//       track={r,g,b} (anel completo desenhado atrás, estilo barra de progresso)
+int l_drawArc(lua_State* L) {
+  const int cx = shapeArgInt(L, 1);
+  const int cy = shapeArgInt(L, 2);
+  const int R = shapeArgInt(L, 3);
+  const float startDeg = (float)luaL_checknumber(L, 4);
+  const float endDeg = (float)luaL_checknumber(L, 5);
+  const bool hasOpts = shapeHasOpts(L, 6);
+
+  if (R <= 0) return 0;
+
+  uint16_t color = tft.color565(255, 255, 255);
+  uint16_t trackColor = 0;
+  bool hasTrack = false;
+  int thick = 1;
+  bool pie = false, caps = false;
+
+  if (hasOpts) {
+    shapeReadColor(L, 6, "color", color);
+    hasTrack = shapeReadColor(L, 6, "track", trackColor);
+    thick = shapeReadInt(L, 6, "thickness", 1);
+    pie = shapeReadBool(L, 6, "pie", false);
+    caps = shapeReadBool(L, 6, "roundCaps", false);
+  }
+
+  thick = shpClamp(thick, 1, R);
+  const int rin = pie ? 0 : (R - thick);
+
+  const float diff = endDeg - startDeg;
+  const bool full = fabsf(diff) >= 360.0f;
+  float sweep = fmodf(diff, 360.0f);
+  if (sweep < 0.0f) sweep += 360.0f;
+
+  if (hasTrack) shapeDrawArc(cx, cy, R, rin, 0.0f, 360.0f, true, trackColor);
+
+  if (full || sweep > 0.0f) {
+    shapeDrawArc(cx, cy, R, rin, startDeg, full ? 360.0f : sweep, full, color);
+
+    if (caps && !pie && !full && thick >= 3) {
+      const float mid = (R + rin) * 0.5f;
+      const int capR = (thick - 1) / 2;
+      for (int k = 0; k < 2; k++) {
+        const float a = (startDeg + (k ? sweep : 0.0f)) * SHAPE_DEG2RAD;
+        const int px = (int)lroundf(cx + mid * sinf(a) - 0.5f);
+        const int py = (int)lroundf(cy - mid * cosf(a) - 0.5f);
+        frame.fillCircle(px, py, capR, color);
+      }
+    }
+  }
+
+  markDirty(cx - R, cy - R, 2 * R, 2 * R);
+  return 0;
+}
+
+// ----- Linhas e polígonos -----
+// Coordenadas de linhas e vértices são coordenadas de pixel (o centro do pixel é usado).
+
+// Disco preenchido com centro/raio em float (usado em pontas e juntas arredondadas)
+static void shapeFillDisc(float cx, float cy, float r, uint16_t color) {
+  const int fw = (int)frame.width();
+  const int fh = (int)frame.height();
+  const int y0 = shpMax((int)floorf(cy - r), 0);
+  const int y1 = shpMin((int)ceilf(cy + r), fh - 1);
+  const float r2 = r * r;
+
+  for (int y = y0; y <= y1; y++) {
+    const float dy = y + 0.5f - cy;
+    const float t = r2 - dy * dy;
+    if (t < 0.0f) continue;
+    const float half = sqrtf(t);
+    const int xa = shpMax((int)ceilf(cx - 0.5f - half), 0);
+    const int xb = shpMin((int)floorf(cx - 0.5f + half), fw - 1);
+    shapeHLine(xa, xb, y, color);
+  }
+}
+
+// Preenche um polígono qualquer (côncavo também, regra par-ímpar) com vértices em float
+static void shapeFillPolyF(const float* px, const float* py, int n, uint16_t color) {
+  if (n < 3 || n > SHAPE_POLY_MAX) return;
+
+  const int fw = (int)frame.width();
+  const int fh = (int)frame.height();
+
+  float ymin = py[0], ymax = py[0];
+  for (int i = 1; i < n; i++) {
+    if (py[i] < ymin) ymin = py[i];
+    if (py[i] > ymax) ymax = py[i];
+  }
+
+  const int y0 = shpMax((int)floorf(ymin), 0);
+  const int y1 = shpMin((int)ceilf(ymax), fh - 1);
+
+  float xs[SHAPE_POLY_MAX];
+
+  for (int y = y0; y <= y1; y++) {
+    const float yc = y + 0.5f;
+    int cnt = 0;
+
+    for (int i = 0; i < n; i++) {
+      const int j = (i + 1 == n) ? 0 : i + 1;
+      const float ya = py[i], yb = py[j];
+      if ((ya <= yc) != (yb <= yc)) {
+        if (cnt < SHAPE_POLY_MAX) {
+          xs[cnt++] = px[i] + (yc - ya) * (px[j] - px[i]) / (yb - ya);
+        }
+      }
+    }
+
+    // ordena (poucos elementos: inserção)
+    for (int a = 1; a < cnt; a++) {
+      float v = xs[a];
+      int b = a - 1;
+      while (b >= 0 && xs[b] > v) { xs[b + 1] = xs[b]; b--; }
+      xs[b + 1] = v;
+    }
+
+    for (int k = 0; k + 1 < cnt; k += 2) {
+      const int xa = shpMax((int)ceilf(xs[k] - 0.5f), 0);
+      const int xb = shpMin((int)ceilf(xs[k + 1] - 0.5f) - 1, fw - 1);
+      shapeHLine(xa, xb, y, color);
+    }
+  }
+}
+
+// Retângulo girado que representa um segmento grosso (h = meia espessura).
+// ext0/ext1 estendem as pontas ao longo da direção do segmento.
+static void shapeStrokeQuad(float x0, float y0, float x1, float y1, float h, float ext0, float ext1, uint16_t color) {
+  const float dx = x1 - x0, dy = y1 - y0;
+  const float len = sqrtf(dx * dx + dy * dy);
+  if (len < 1e-4f) return;
+
+  const float ux = dx / len, uy = dy / len;
+  x0 -= ux * ext0;
+  y0 -= uy * ext0;
+  x1 += ux * ext1;
+  y1 += uy * ext1;
+
+  const float nx = -uy * h, ny = ux * h;
+  const float qx[4] = {x0 + nx, x1 + nx, x1 - nx, x0 - nx};
+  const float qy[4] = {y0 + ny, y1 + ny, y1 - ny, y0 - ny};
+  shapeFillPolyF(qx, qy, 4, color);
+}
+
+// Segmento com espessura e pontas opcionalmente arredondadas
+static void shapeStrokeSegment(float x0, float y0, float x1, float y1, int thick, bool roundCaps, bool extend, uint16_t color) {
+  const bool rounded = roundCaps && thick >= 3;
+  const float h = thick * 0.5f;
+
+  if (thick <= 1 && !rounded) {
+    frame.drawLine((int)floorf(x0), (int)floorf(y0), (int)floorf(x1), (int)floorf(y1), color);
+    return;
+  }
+
+  const float dx = x1 - x0, dy = y1 - y0;
+  if (dx * dx + dy * dy < 1e-6f) {   // ponto
+    shapeFillDisc(x0, y0, h, color);
+    return;
+  }
+
+  const float ext = (extend && !rounded) ? 0.5f : 0.0f;
+  shapeStrokeQuad(x0, y0, x1, y1, h, ext, ext, color);
+
+  if (rounded) {
+    shapeFillDisc(x0, y0, h, color);
+    shapeFillDisc(x1, y1, h, color);
+  }
+}
+
+// Junta entre dois segmentos grossos que se encontram no vértice (vx, vy)
+static void shapeStrokeJoin(float ax, float ay, float vx, float vy, float bx, float by, float h, int join, uint16_t color) {
+  float d1x = vx - ax, d1y = vy - ay;
+  float d2x = bx - vx, d2y = by - vy;
+  const float l1 = sqrtf(d1x * d1x + d1y * d1y);
+  const float l2 = sqrtf(d2x * d2x + d2y * d2y);
+  if (l1 < 1e-4f || l2 < 1e-4f) return;
+
+  d1x /= l1; d1y /= l1;
+  d2x /= l2; d2y /= l2;
+
+  const float cross = d1x * d2y - d1y * d2x;
+  const float dot = d1x * d2x + d1y * d2y;
+  if (fabsf(cross) < 1e-3f) return;   // reto: não tem fresta pra preencher
+
+  if (join == SHAPE_JOIN_ROUND) {
+    shapeFillDisc(vx, vy, h, color);
+    return;
+  }
+
+  // Lado de fora da curva
+  const float side = (cross > 0.0f) ? -1.0f : 1.0f;
+  const float o1x = -d1y * side * h, o1y = d1x * side * h;
+  const float o2x = -d2y * side * h, o2y = d2x * side * h;
+
+  float qx[4], qy[4];
+  int m = 0;
+  qx[m] = vx;       qy[m] = vy;       m++;
+  qx[m] = vx + o1x; qy[m] = vy + o1y; m++;
+
+  // Ponta da quina (limitada: em ângulos muito fechados vira bevel)
+  if (join == SHAPE_JOIN_MITER && (1.0f + dot) >= 0.2222f) {
+    const float k = 1.0f / (1.0f + dot);
+    qx[m] = vx + (o1x + o2x) * k;
+    qy[m] = vy + (o1y + o2y) * k;
+    m++;
+  }
+
+  qx[m] = vx + o2x; qy[m] = vy + o2y; m++;
+  shapeFillPolyF(qx, qy, m, color);
+}
+
+static void shapeStrokePolygon(const float* px, const float* py, int n, bool closed, int bw, int join, bool roundCaps, uint16_t color) {
+  const float h = bw * 0.5f;
+  const bool rounded = roundCaps && bw >= 3;
+  const int edges = closed ? n : n - 1;
+
+  for (int e = 0; e < edges; e++) {
+    const int i = e;
+    const int j = (e + 1) % n;
+    const float ext0 = (!closed && e == 0 && !rounded) ? 0.5f : 0.0f;
+    const float ext1 = (!closed && e == edges - 1 && !rounded) ? 0.5f : 0.0f;
+    shapeStrokeQuad(px[i], py[i], px[j], py[j], h, ext0, ext1, color);
+  }
+
+  const int vStart = closed ? 0 : 1;
+  const int vEnd = closed ? n : n - 1;
+  for (int v = vStart; v < vEnd; v++) {
+    const int p = (v - 1 + n) % n;
+    const int q = (v + 1) % n;
+    shapeStrokeJoin(px[p], py[p], px[v], py[v], px[q], py[q], h, join, color);
+  }
+
+  if (!closed && rounded) {
+    shapeFillDisc(px[0], py[0], h, color);
+    shapeFillDisc(px[n - 1], py[n - 1], h, color);
+  }
+}
+
+static void shapeDrawPolygon(const int* xs, const int* ys, int n, bool closed, const ShapeStyle& st, int join, bool roundCaps) {
+  float px[SHAPE_POLY_MAX], py[SHAPE_POLY_MAX];
+  for (int i = 0; i < n; i++) {
+    px[i] = xs[i] + 0.5f;
+    py[i] = ys[i] + 0.5f;
+  }
+
+  if (st.hasFill) shapeFillPolyF(px, py, n, st.fill);
+
+  if (st.hasBorder) {
+    if (st.bw <= 1) {
+      const int edges = closed ? n : n - 1;
+      for (int e = 0; e < edges; e++) {
+        const int j = (e + 1) % n;
+        frame.drawLine(xs[e], ys[e], xs[j], ys[j], st.border);
+      }
+    } else {
+      shapeStrokePolygon(px, py, n, closed, st.bw, join, roundCaps, st.border);
+    }
+  }
+}
+
+// Lê pontos de uma tabela Lua: {{x,y}, {x,y}, ...} ou {x1,y1, x2,y2, ...}
+static int shapeReadPoints(lua_State* L, int idx, int* xs, int* ys, int maxN) {
+  luaL_checktype(L, idx, LUA_TTABLE);
+  const int len = (int)luaL_len(L, idx);
+  if (len <= 0) return 0;
+
+  lua_rawgeti(L, idx, 1);
+  const bool nested = lua_istable(L, -1);
+  lua_pop(L, 1);
+
+  int n = 0;
+  if (nested) {
+    if (len > maxN) luaL_error(L, "polygon has too many points (max %d)", maxN);
+    for (int i = 1; i <= len; i++) {
+      lua_rawgeti(L, idx, i);
+      luaL_checktype(L, -1, LUA_TTABLE);
+      lua_rawgeti(L, -1, 1);
+      lua_rawgeti(L, -2, 2);
+      xs[n] = (int)lroundf((float)lua_tonumber(L, -2));
+      ys[n] = (int)lroundf((float)lua_tonumber(L, -1));
+      lua_pop(L, 3);
+      n++;
+    }
+  } else {
+    if (len / 2 > maxN) luaL_error(L, "polygon has too many points (max %d)", maxN);
+    for (int i = 1; i + 1 <= len; i += 2) {
+      lua_rawgeti(L, idx, i);
+      lua_rawgeti(L, idx, i + 1);
+      xs[n] = (int)lroundf((float)lua_tonumber(L, -2));
+      ys[n] = (int)lroundf((float)lua_tonumber(L, -1));
+      lua_pop(L, 2);
+      n++;
+    }
+  }
+  return n;
+}
+
+static int shapeReadJoin(lua_State* L, int idx) {
+  int join = SHAPE_JOIN_MITER;
+  lua_getfield(L, idx, "join");
+  if (lua_type(L, -1) == LUA_TSTRING) {
+    const char* s = lua_tostring(L, -1);
+    if (strcmp(s, "round") == 0) join = SHAPE_JOIN_ROUND;
+    else if (strcmp(s, "bevel") == 0) join = SHAPE_JOIN_BEVEL;
+  }
+  lua_pop(L, 1);
+  return join;
+}
+
+// Display_DrawPoligon(points [, opts])
+// points: {{x,y}, {x,y}, ...} ou {x1,y1, x2,y2, ...}  (até SHAPE_POLY_MAX = 64 vértices)
+// opts: fill={r,g,b}, border={r,g,b}, borderWidth=n (padrão 1, centrada na aresta),
+//       join="miter"|"bevel"|"round" (quinas da borda grossa, padrão "miter"),
+//       closed=false (linha poligonal aberta), roundCaps=true (pontas redondas se aberta)
+// Sem fill e sem border: polígono fechado é preenchido de branco; aberto vira linha branca.
+int l_drawPoligon(lua_State* L) {
+  int xs[SHAPE_POLY_MAX], ys[SHAPE_POLY_MAX];
+  int n = shapeReadPoints(L, 1, xs, ys, SHAPE_POLY_MAX);
+  const bool hasOpts = shapeHasOpts(L, 2);
+
+  // Remove vértices repetidos em sequência
+  int m = 0;
+  for (int i = 0; i < n; i++) {
+    if (m == 0 || xs[i] != xs[m - 1] || ys[i] != ys[m - 1]) {
+      xs[m] = xs[i];
+      ys[m] = ys[i];
+      m++;
+    }
+  }
+  n = m;
+
+  bool closed = hasOpts ? shapeReadBool(L, 2, "closed", true) : true;
+  if (closed && n > 1 && xs[0] == xs[n - 1] && ys[0] == ys[n - 1]) n--;
+  if (n < 2) return 0;
+  if (n == 2) closed = false;
+
+  ShapeStyle st;
+  shapeReadStyle(L, 2, hasOpts, 64, closed, st);
+
+  int join = SHAPE_JOIN_MITER;
+  bool roundCaps = false;
+  if (hasOpts) {
+    join = shapeReadJoin(L, 2);
+    roundCaps = shapeReadBool(L, 2, "roundCaps", false);
+  }
+
+  shapeDrawPolygon(xs, ys, n, closed, st, join, roundCaps);
+
+  int minX = xs[0], maxX = xs[0], minY = ys[0], maxY = ys[0];
+  for (int i = 1; i < n; i++) {
+    minX = shpMin(minX, xs[i]);
+    maxX = shpMax(maxX, xs[i]);
+    minY = shpMin(minY, ys[i]);
+    maxY = shpMax(maxY, ys[i]);
+  }
+  const int pad = st.hasBorder ? (st.bw * 2 + 2) : 1;   // folga pra espessura e pontas das quinas
+  markDirty(minX - pad, minY - pad, (maxX - minX + 1) + 2 * pad, (maxY - minY + 1) + 2 * pad);
+  return 0;
+}
+
+// Display_DrawLine(x1, y1, x2, y2 [, opts])
+// opts: color={r,g,b} (padrão branco), thickness=n (padrão 1), roundCaps=true (pontas redondas),
+//       dash=n (comprimento do traço, liga o tracejado), gap=n (espaço entre traços, padrão = dash)
+// Dica: dash=1 + gap grande + roundCaps + thickness>=3 faz uma linha pontilhada.
+int l_drawLine(lua_State* L) {
+  const int x1 = shapeArgInt(L, 1);
+  const int y1 = shapeArgInt(L, 2);
+  const int x2 = shapeArgInt(L, 3);
+  const int y2 = shapeArgInt(L, 4);
+  const bool hasOpts = shapeHasOpts(L, 5);
+
+  uint16_t color = tft.color565(255, 255, 255);
+  int thick = 1, dash = 0, gap = -1;
+  bool caps = false;
+
+  if (hasOpts) {
+    shapeReadColor(L, 5, "color", color);
+    thick = shapeReadInt(L, 5, "thickness", 1);
+    caps = shapeReadBool(L, 5, "roundCaps", false);
+    dash = shapeReadInt(L, 5, "dash", 0);
+    gap = shapeReadInt(L, 5, "gap", -1);
+  }
+  thick = shpClamp(thick, 1, 255);
+
+  const float ax = x1 + 0.5f, ay = y1 + 0.5f;
+  const float bx = x2 + 0.5f, by = y2 + 0.5f;
+
+  if (dash <= 0) {
+    shapeStrokeSegment(ax, ay, bx, by, thick, caps, true, color);
+  } else {
+    if (gap < 0) gap = dash;
+    const float dx = bx - ax, dy = by - ay;
+    const float len = sqrtf(dx * dx + dy * dy);
+
+    if (len < 1e-4f) {
+      shapeStrokeSegment(ax, ay, bx, by, thick, caps, false, color);
+    } else {
+      const float ux = dx / len, uy = dy / len;
+      const float period = (float)(dash + gap);
+      // Com 1 px de espessura o drawLine inclui as duas pontas, então o traço é 1 px mais curto
+      const float dashLen = (thick <= 1) ? (float)(dash - 1) : (float)dash;
+
+      for (float pos = 0.0f; pos < len; pos += period) {
+        const float e = fminf(pos + dashLen, len);
+        shapeStrokeSegment(ax + ux * pos, ay + uy * pos, ax + ux * e, ay + uy * e, thick, caps, false, color);
+      }
+    }
+  }
+
+  const int pad = thick / 2 + 2;
+  const int minX = shpMin(x1, x2), minY = shpMin(y1, y2);
+  const int w = (x1 > x2 ? x1 - x2 : x2 - x1) + 1;
+  const int h = (y1 > y2 ? y1 - y2 : y2 - y1) + 1;
+  markDirty(minX - pad, minY - pad, w + 2 * pad, h + 2 * pad);
+  return 0;
+}
+
 // Sprites
 static Sprite* checkSprite(lua_State* L, int index) {
   return (Sprite*)luaL_checkudata(L, index, LUA_SPRITE_DEFINITION);
@@ -710,6 +1493,7 @@ static volatile bool bleDisconnected = false;
 volatile bool bluetoothEnabled = false;   // estado inicial do Bluetooth (true = igual ao comportamento anterior)
 static bool bleStackUp = false;
 static std::string bleTargetName;
+static char bleConnectedName[48] = "";   // nome do dispositivo conectado (cópia segura pro Lua)
 
 // Blacklist: dispositivos recusados com "N". Só é esvaziada quando o Bluetooth é desligado/ligado.
 static std::vector<std::string> bleBlacklist;
@@ -881,6 +1665,7 @@ static bool bleConnectMouse() {
   mouseScroll = 0;
   portEXIT_CRITICAL(&mouseMux);
 
+  strlcpy(bleConnectedName, bleTargetName.empty() ? "Mouse" : bleTargetName.c_str(), sizeof(bleConnectedName));
   mouseConnected = true;
   Serial.println("[BLE] Mouse connected");
   return true;
@@ -893,9 +1678,9 @@ static void bleStackStart() {
 
   NimBLEScan* scan = NimBLEDevice::getScan();
   scan->setScanCallbacks(&bleScanCb, false);
-  scan->setActiveScan(true);
-  scan->setInterval(100);
-  scan->setWindow(99);
+  scan->setActiveScan(false);   // passivo: bem mais leve pro rádio compartilhado com o Wi-Fi
+  scan->setInterval(160);
+  scan->setWindow(30);          // ~19% de ocupação (antes 99%: matava o scan Wi-Fi)
 
   bleClient = nullptr;
   bleDisconnected = false;
@@ -1303,23 +2088,296 @@ static void kernelHideToast() {
   kernelResumeLua();
 }
 
-// ----- Wi-Fi / Bluetooth -----
+// ----- Wi-Fi (gerenciador: varredura, conexão e sincronização de hora em background) -----
 volatile bool wifiEnabled = false;   // o syncTime() já deixa o Wi-Fi desligado depois do boot
 
+#define WIFI_CONNECT_TIMEOUT_MS 20000   // tempo máximo tentando conectar
+#define WIFI_FAILED_SHOW_MS 3000        // por quanto tempo o status "failed" fica visível pro Lua
+#define WIFI_SCAN_INTERVAL_MS 8000      // intervalo entre varreduras (enquanto alguém pede a lista)
+#define WIFI_SCAN_KEEPALIVE_MS 15000    // varre por esse tempo depois da última chamada de OS_GetFoundWifiNetworks
+#define WIFI_SCAN_TIMEOUT_MS 10000
+#define WIFI_MAX_NETWORKS 24
+#define WIFI_TIME_RETRY_MS 15000        // espera entre tentativas de sincronizar a hora
+
+// Credenciais salvas (cópia de SystemConfiguration["Wifi"]). O JSON só é atualizado e gravado
+// em wifiFlushPendingSave(), que roda na task Lua (a mesma que usa o SD nos outros saves).
+static char wifiSavedSsid[33] = "";
+static char wifiSavedPass[65] = "";
+static volatile bool wifiSavePending = false;
+
+static volatile bool wifiConnecting = false;
+static volatile bool wifiFailed = false;
+static volatile uint32_t wifiFailedAtMs = 0;
+static volatile bool wifiTimeSynced = false;
+
+static volatile bool wifiScanStarted = false;
+static volatile bool wifiScanning = false;
+static volatile bool wifiScanNow = false;
+static volatile uint32_t wifiScanKeepUntilMs = 0;
+
+static volatile bool wifiConnReq = false;     // pedido de conexão vindo do Lua
+static char wifiReqSsid[33] = "";
+static char wifiReqPass[65] = "";
+
+static std::vector<std::string> wifiNetworks;           // SSIDs da última varredura (mais forte primeiro)
+static SemaphoreHandle_t wifiNetMutex = nullptr;        // protege wifiNetworks
+static SemaphoreHandle_t wifiDrvMutex = nullptr;        // protege chamadas curtas ao driver (WiFi.*)
+
+static inline void wifiLock()   { if (wifiDrvMutex) xSemaphoreTake(wifiDrvMutex, portMAX_DELAY); }
+static inline void wifiUnlock() { if (wifiDrvMutex) xSemaphoreGive(wifiDrvMutex); }
+
+#define WIFI_AUTOCONNECT_MS 12000   // tempo dado pra rede salva conectar antes de liberar scan/retry
+#define WIFI_RECONNECT_MS 15000     // intervalo entre novas tentativas na rede salva
+static volatile uint32_t wifiLastBeginMs = 0;
+
+// Chamar com o lock do driver
+static void wifiBeginSaved() {
+  if (wifiSavedSsid[0] != '\0') {
+    WiFi.begin(wifiSavedSsid, wifiSavedPass[0] ? wifiSavedPass : nullptr);   // não bloqueia
+    wifiLastBeginMs = millis();
+    Serial.printf("[WIFI] Auto-connecting to saved '%s'\n", wifiSavedSsid);
+  }
+}
+
 static void wifiApply(bool on) {
+  wifiLock();
   if (on) {
-    const char* ssid = SystemConfiguration["Wifi"]["ssid"] | "";
-    const char* password = SystemConfiguration["Wifi"]["password"] | "";
     WiFi.mode(WIFI_STA);
-    if (strlen(ssid) > 0) WiFi.begin(ssid, password);   // não bloqueia
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(false);
     wifiEnabled = true;
+    wifiFailed = false;
+    wifiTimeSynced = false;
+    wifiScanNow = true;
+    wifiBeginSaved();          // conecta sozinho na rede salva no SystemConfiguration
     Serial.println("[WIFI] ON");
   } else {
+    wifiEnabled = false;       // antes de derrubar o driver: a task Wi-Fi vê isso e abandona o que estava fazendo
+    wifiConnReq = false;
+    wifiConnecting = false;
+    wifiFailed = false;
+    wifiTimeSynced = false;
+    if (wifiScanStarted) esp_wifi_scan_stop();
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
-    wifiEnabled = false;
     Serial.println("[WIFI] OFF");
   }
+  wifiUnlock();
+
+  if (!on && wifiNetMutex && xSemaphoreTake(wifiNetMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    wifiNetworks.clear();
+    xSemaphoreGive(wifiNetMutex);
+  }
+}
+
+// Atualiza o JSON do sistema com as credenciais que funcionaram e grava no SD.
+// Roda no contexto da task Lua (chamada por OS_GetWifiStatus).
+static void wifiFlushPendingSave() {
+  if (!wifiSavePending) return;
+  wifiSavePending = false;
+
+  // const char* explícito: o ArduinoJson guarda o ponteiro (sem copiar), então o JSON sempre
+  // reflete o buffer e o documento não vai enchendo a cada nova conexão
+  SystemConfiguration["Wifi"]["ssid"] = (const char*)wifiSavedSsid;
+  SystemConfiguration["Wifi"]["password"] = (const char*)wifiSavedPass;
+  saveSystemPreferences();
+}
+
+static void wifiCollectScanResults(int n) {
+  std::vector<std::pair<int, std::string>> found;   // (rssi, ssid)
+
+  for (int i = 0; i < n; i++) {
+    String s = WiFi.SSID(i);
+    if (s.length() == 0) continue;   // rede oculta
+    const int rssi = WiFi.RSSI(i);
+
+    bool dup = false;
+    for (auto& f : found) {
+      if (f.second == s.c_str()) {
+        if (rssi > f.first) f.first = rssi;
+        dup = true;
+        break;
+      }
+    }
+    if (!dup) found.push_back(std::make_pair(rssi, std::string(s.c_str())));
+  }
+
+  std::sort(found.begin(), found.end(),
+            [](const std::pair<int, std::string>& a, const std::pair<int, std::string>& b) { return a.first > b.first; });
+  if (found.size() > WIFI_MAX_NETWORKS) found.resize(WIFI_MAX_NETWORKS);
+
+  if (wifiNetMutex && xSemaphoreTake(wifiNetMutex, portMAX_DELAY) == pdTRUE) {
+    wifiNetworks.clear();
+    for (auto& f : found) wifiNetworks.push_back(f.second);
+    xSemaphoreGive(wifiNetMutex);
+  }
+  Serial.printf("[WIFI] Scan: %d networks\n", (int)found.size());
+}
+
+// Conecta (bloqueia só a task Wi-Fi). Em caso de sucesso guarda as credenciais e agenda o save;
+// a hora é sincronizada em seguida pelo loop da task.
+static void wifiConnectNow(const char* ssid, const char* pass) {
+  Serial.printf("[WIFI] Connecting to '%s'\n", ssid);
+
+  wifiLock();
+  if (wifiScanStarted) {
+    esp_wifi_scan_stop();
+    WiFi.scanDelete();
+    wifiScanStarted = false;
+    wifiScanning = false;
+  }
+  if (!wifiEnabled) {
+    WiFi.mode(WIFI_STA);
+    wifiEnabled = true;
+  }
+  wifiFailed = false;
+  wifiTimeSynced = false;
+  WiFi.disconnect();
+  WiFi.begin(ssid, pass[0] ? pass : nullptr);
+  wifiUnlock();
+
+  const uint32_t t0 = millis();
+  bool ok = false;
+  while ((millis() - t0) < WIFI_CONNECT_TIMEOUT_MS) {
+    if (!wifiEnabled) break;      // desligaram o Wi-Fi
+    if (wifiConnReq) break;       // veio outro pedido: abandona este
+    const wl_status_t st = WiFi.status();
+    if (st == WL_CONNECTED) { ok = true; break; }
+    if ((millis() - t0) > 1500 && (st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL)) break;
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+
+  if (!wifiEnabled || wifiConnReq) return;   // o próximo pedido (ou o desligamento) cuida do estado
+
+  if (ok) {
+    strlcpy(wifiSavedSsid, ssid, sizeof(wifiSavedSsid));
+    strlcpy(wifiSavedPass, pass, sizeof(wifiSavedPass));
+    wifiSavePending = true;
+    Serial.println("[WIFI] Connected");
+  } else {
+    Serial.println("[WIFI] Connection failed");
+    wifiFailedAtMs = millis();
+    wifiFailed = true;
+    // Volta pra rede que estava salva antes
+    wifiLock();
+    WiFi.disconnect();
+    wifiBeginSaved();
+    wifiUnlock();
+  }
+  wifiConnecting = false;
+}
+
+static void wifiTask(void* arg) {
+  uint32_t lastScanMs = 0, scanStartMs = 0, nextTimeSyncMs = 0;
+
+  for (;;) {
+    // ----- pedido de conexão -----
+    if (wifiConnReq) {
+      char ssid[33], pass[65];
+      strlcpy(ssid, wifiReqSsid, sizeof(ssid));
+      strlcpy(pass, wifiReqPass, sizeof(pass));
+      wifiConnReq = false;
+      wifiConnectNow(ssid, pass);
+      continue;
+    }
+
+    const uint32_t now = millis();
+
+    // ----- varredura (só enquanto alguém está pedindo a lista) -----
+    const bool wifiLinked = (WiFi.status() == WL_CONNECTED);
+    const bool haveSaved = (wifiSavedSsid[0] != '\0');
+    // Enquanto a rede salva está tentando conectar, não varre (o scan derrubaria a tentativa)
+    const bool inAttempt = wifiEnabled && haveSaved && !wifiLinked && !wifiConnecting && !wifiScanStarted &&
+                           (now - wifiLastBeginMs) < WIFI_AUTOCONNECT_MS;
+    // Conectado a uma rede: NÃO varre mais (a lista fica com o último resultado)
+    const bool wantScan = wifiEnabled && !wifiConnecting && !inAttempt && !wifiLinked && (int32_t)(wifiScanKeepUntilMs - now) > 0;
+
+    // ----- mantém conectado na rede salva: se caiu / não conectou, tenta de novo -----
+    if (wifiEnabled && haveSaved && !wifiLinked && !wifiConnecting && !wifiScanStarted && !inAttempt &&
+        (now - wifiLastBeginMs) >= WIFI_RECONNECT_MS) {
+      wifiLock();
+      WiFi.disconnect(false);
+      wifiBeginSaved();
+      wifiUnlock();
+    }
+
+    if (wifiScanStarted) {
+      if (!wifiEnabled) {
+        wifiScanStarted = false;
+        wifiScanning = false;
+      } else {
+        const int n = WiFi.scanComplete();
+        if (n == WIFI_SCAN_RUNNING) {
+          if ((now - scanStartMs) > WIFI_SCAN_TIMEOUT_MS) {
+            wifiLock();
+            esp_wifi_scan_stop();
+            WiFi.scanDelete();
+            wifiUnlock();
+            wifiScanStarted = false;
+            wifiScanning = false;
+          }
+        } else {
+          if (n >= 0) wifiCollectScanResults(n);
+          wifiLock();
+          WiFi.scanDelete();
+          if (!wifiConnecting && WiFi.status() != WL_CONNECTED) wifiBeginSaved();
+          wifiUnlock();
+          wifiScanStarted = false;
+          wifiScanning = false;
+        }
+      }
+    } else if (wantScan && (wifiScanNow || (now - lastScanMs) >= WIFI_SCAN_INTERVAL_MS)) {
+      wifiScanNow = false;
+      lastScanMs = now;
+      wifiLock();
+      WiFi.scanDelete();
+      if (WiFi.status() != WL_CONNECTED) WiFi.disconnect(false);   // cancela "connecting" pendente que derruba o scan
+      const int r = WiFi.scanNetworks(true, false);   // assíncrono, sem redes ocultas
+      wifiUnlock();
+      Serial.printf("[WIFI] scanNetworks -> %d\n", r);
+      if (r == WIFI_SCAN_RUNNING || r >= 0) {
+        wifiScanStarted = true;
+        wifiScanning = true;
+        scanStartMs = now;
+      } else {
+        lastScanMs = now - WIFI_SCAN_INTERVAL_MS + 1000;   // falhou: tenta de novo em ~1 s
+      }
+    }
+
+    // ----- hora: sincroniza sempre que conectar -----
+    if (wifiEnabled && !wifiConnecting) {
+      if (WiFi.status() == WL_CONNECTED) {
+        if (!wifiTimeSynced && (int32_t)(now - nextTimeSyncMs) >= 0) {
+          configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+          struct tm ti;
+          if (getLocalTime(&ti, 5000)) {
+            wifiTimeSynced = true;
+            Serial.println("[WIFI] Time synchronized");
+          } else {
+            nextTimeSyncMs = millis() + WIFI_TIME_RETRY_MS;
+            Serial.println("[WIFI] NTP sync failed, retrying later");
+          }
+        }
+      } else {
+        wifiTimeSynced = false;
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+void wifiManagerBegin() {
+  if (!wifiDrvMutex) wifiDrvMutex = xSemaphoreCreateMutex();
+  if (!wifiNetMutex) wifiNetMutex = xSemaphoreCreateMutex();
+
+  const char* ssid = SystemConfiguration["Wifi"]["ssid"] | "";
+  const char* pass = SystemConfiguration["Wifi"]["password"] | "";
+  strlcpy(wifiSavedSsid, ssid, sizeof(wifiSavedSsid));
+  strlcpy(wifiSavedPass, pass, sizeof(wifiSavedPass));
+
+  xTaskCreatePinnedToCore(wifiTask, "WIFI_MGR", 8192, NULL, 1, NULL, 0);
+  Serial.println("Wifi manager task started");
 }
 
 static void bluetoothApply(bool on) {
@@ -1334,8 +2392,149 @@ int l_OS_IsWifiEnabled(lua_State* L) {
   return 1;
 }
 
+// OS_GetConnectedBluetoothName() -> string | nil
+int l_OS_GetConnectedBluetoothName(lua_State* L) {
+  if (bluetoothEnabled && mouseConnected) lua_pushstring(L, bleConnectedName);
+  else lua_pushnil(L);
+  return 1;
+}
+
 int l_OS_IsBluetoothEnabled(lua_State* L) {
   lua_pushboolean(L, bluetoothEnabled);
+  return 1;
+}
+
+// OS_EnableWifi() / OS_DisableWifi()
+// Só age se o estado realmente mudar. Não mostra toast: o toast pausa a task Lua
+// e esperaria o próprio checkpoint dela (travaria ~400 ms se chamado daqui).
+int l_OS_EnableWifi(lua_State* L) {
+  if (!wifiEnabled) wifiApply(true);
+  return 0;
+}
+
+int l_OS_DisableWifi(lua_State* L) {
+  if (wifiEnabled) wifiApply(false);
+  return 0;
+}
+
+// OS_EnableBluetooth() / OS_DisableBluetooth()
+// Só age se o estado mudar (bluetoothApply também zera a blacklist de mouses recusados).
+int l_OS_EnableBluetooth(lua_State* L) {
+  if (!bluetoothEnabled) bluetoothApply(true);
+  return 0;
+}
+
+int l_OS_DisableBluetooth(lua_State* L) {
+  if (bluetoothEnabled) bluetoothApply(false);
+  return 0;
+}
+
+// OS_GetFoundWifiNetworks() -> { "ssid1", "ssid2", ... }
+// Lista (só SSIDs, sem repetição, sinal mais forte primeiro) da última varredura.
+// Enquanto for chamada de tempos em tempos, o kernel mantém varreduras em background;
+// ~15 s sem chamadas e ele para de varrer. Vazia se o Wi-Fi estiver desligado.
+int l_OS_GetFoundWifiNetworks(lua_State* L) {
+  const uint32_t now = millis();
+  if ((int32_t)(wifiScanKeepUntilMs - now) <= 0) wifiScanNow = true;   // ninguém pedia: varre já
+  wifiScanKeepUntilMs = now + WIFI_SCAN_KEEPALIVE_MS;
+
+  // Copia sob o mutex e só depois mexe na pilha do Lua (um erro de memória do Lua não pode deixar o mutex preso)
+  std::vector<std::string> copy;
+  if (wifiNetMutex && xSemaphoreTake(wifiNetMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    copy = wifiNetworks;
+    xSemaphoreGive(wifiNetMutex);
+  }
+
+  // Conectado e sem varredura: garante que a rede atual apareça na lista
+  if (wifiEnabled && !wifiConnecting && WiFi.status() == WL_CONNECTED) {
+    std::string cur = WiFi.SSID().c_str();
+    bool has = false;
+    for (auto& e : copy) if (e == cur) { has = true; break; }
+    if (!has && !cur.empty()) copy.insert(copy.begin(), cur);
+  }
+
+  lua_createtable(L, (int)copy.size(), 0);
+  for (size_t i = 0; i < copy.size(); i++) {
+    lua_pushstring(L, copy[i].c_str());
+    lua_rawseti(L, -2, (lua_Integer)(i + 1));
+  }
+  return 1;
+}
+
+// OS_ConnectWifi(ssid [, password])
+// Liga o Wi-Fi se preciso, conecta (em background), e se der certo grava ssid/senha em
+// SystemConfiguration["Wifi"] (general.json) e sincroniza a hora. Acompanhe com OS_GetWifiStatus().
+int l_OS_ConnectWifi(lua_State* L) {
+  const char* ssid = luaL_checkstring(L, 1);
+  const char* pass = luaL_optstring(L, 2, "");
+  if (ssid[0] == '\0') return 0;
+
+  strlcpy(wifiReqSsid, ssid, sizeof(wifiReqSsid));
+  strlcpy(wifiReqPass, pass, sizeof(wifiReqPass));
+  wifiFailed = false;
+  wifiConnecting = true;    // já vale antes da task acordar, pro Lua não ler um status velho
+  wifiConnReq = true;
+  return 0;
+}
+
+// OS_GetWifiStatus() -> "off" | "idle" | "connecting" | "connected" | "failed"
+// "failed" aparece por ~3 s depois de uma tentativa de OS_ConnectWifi que não deu certo.
+// Também é aqui que as credenciais novas são gravadas no SD (precisa ser chamada de vez em quando).
+int l_OS_GetWifiStatus(lua_State* L) {
+  wifiFlushPendingSave();
+
+  const char* s;
+  if (!wifiEnabled) s = "off";
+  else if (wifiConnecting) s = "connecting";
+  else if (wifiFailed && (uint32_t)(millis() - wifiFailedAtMs) < WIFI_FAILED_SHOW_MS) s = "failed";
+  else if (WiFi.status() == WL_CONNECTED) s = "connected";
+  else s = "idle";
+
+  lua_pushstring(L, s);
+  return 1;
+}
+
+// OS_GetConnectedWifiSSID() -> string | nil
+int l_OS_GetConnectedWifiSSID(lua_State* L) {
+  if (wifiEnabled && !wifiConnecting && WiFi.status() == WL_CONNECTED) {
+    lua_pushstring(L, WiFi.SSID().c_str());
+  } else {
+    lua_pushnil(L);
+  }
+  return 1;
+}
+
+// OS_ForgetWifi()
+// Desconecta da rede atual e esquece as credenciais salvas (ssid/senha em SystemConfiguration["Wifi"]).
+// O Wi-Fi continua ligado (sem reconectar sozinho) e a varredura volta a funcionar.
+int l_OS_ForgetWifi(lua_State* L) {
+  wifiConnReq = false;
+  wifiConnecting = false;
+  wifiFailed = false;
+  wifiTimeSynced = false;
+
+  wifiLock();
+  if (wifiScanStarted) {
+    esp_wifi_scan_stop();
+    WiFi.scanDelete();
+    wifiScanStarted = false;
+    wifiScanning = false;
+  }
+  WiFi.disconnect(false);
+  wifiSavedSsid[0] = '\0';
+  wifiSavedPass[0] = '\0';
+  wifiUnlock();
+
+  wifiSavePending = true;
+  wifiFlushPendingSave();   // grava no SD agora (esta função roda na task Lua)
+  wifiScanNow = true;
+  Serial.println("[WIFI] Network forgotten");
+  return 0;
+}
+
+// OS_IsWifiScanning() -> boolean
+int l_OS_IsWifiScanning(lua_State* L) {
+  lua_pushboolean(L, wifiScanning);
   return 1;
 }
 
@@ -1378,11 +2577,11 @@ static void drawBluetoothDialog(const char* name, const char* addr) {
   tft.setTextSize(1);
   tft.setTextColor(TFT_WHITE, bg);
   tft.setTextDatum(textdatum_t::top_center);
-  tft.drawString("Mouse Bluetooth encontrado", cx, y + 12);
-  tft.drawString("Conectar a este dispositivo?", cx, y + 32);
+  tft.drawString("Found Bluetooth Mouse", cx, y + 12);
+  tft.drawString("Connect to this device?", cx, y + 32);
   tft.drawString(name, cx, y + 58);
   tft.drawString(addr, cx, y + 76);
-  tft.drawString("[S] Sim        [N] Nao", cx, y + 102);
+  tft.drawString("[S] Yes        [N] No", cx, y + 102);
 }
 
 static void kernelRunBluetoothDialog() {
@@ -1502,7 +2701,7 @@ static void kernelTask(void* arg) {
       btLastMs = now;
       bool on = !bluetoothEnabled;
       bluetoothApply(on);
-      kernelShowToast(on ? "Bluetooth ativado" : "Bluetooth desativado");
+      kernelShowToast(on ? "Bluetooth activated" : "Bluetooth deactivated");
     }
     btHeld = btDown;
 
@@ -1802,6 +3001,27 @@ struct Font {
         }
     }
 
+    // Largura (px) que drawString() vai ocupar com esse texto e tamanho
+    int measure(const char* text, int pts){
+        if(!data || fontSize == 0) return 0;
+
+        float scale = (float)pts / (float)fontSize;
+        int w = 0;
+
+        while(*text){
+            uint8_t c = *text++;
+            Glyph* gptr = findGlyph(c);
+
+            if(!gptr){
+                w += pts / 2;
+                continue;
+            }
+
+            w += (int)(gptr->advance * scale);
+        }
+        return w;
+    }
+
     void freeMemory(){
         if(data){
             heap_caps_free(data);
@@ -1849,6 +3069,17 @@ int l_font_draw(lua_State* L){
     return 0;
 }
 
+// font:getTextWidth(text, pts) -> integer
+int l_font_measure(lua_State* L){
+
+    Font* font = (Font*)luaL_checkudata(L, 1, "Font");
+    const char* text = luaL_checkstring(L, 2);
+    int pts = (int)luaL_checknumber(L, 3);
+
+    lua_pushinteger(L, font->measure(text, pts));
+    return 1;
+}
+
 int l_font_gc(lua_State* L){
 
     Font* font = (Font*)luaL_checkudata(L, 1, "Font");
@@ -1868,6 +3099,9 @@ void registerFont(lua_State* L){
 
     lua_pushcfunction(L, l_font_draw);
     lua_setfield(L, -2, "drawString");
+
+    lua_pushcfunction(L, l_font_measure);
+    lua_setfield(L, -2, "getTextWidth");
 
     lua_setfield(L, -2, "__index");
 
@@ -1925,6 +3159,22 @@ void registerApis(lua_State* L) {
   lua_register(L, LUA_OS_UPDATE_MOUSE_TASK_DEFINITION, l_OS_UpdateMouseTask);
   lua_register(L, LUA_OS_IS_WIFI_ENABLED_DEFINITION, l_OS_IsWifiEnabled);
   lua_register(L, LUA_OS_IS_BLUETOOTH_ENABLED_DEFINITION, l_OS_IsBluetoothEnabled);
+  lua_register(L, LUA_OS_ENABLE_WIFI_DEFINITION, l_OS_EnableWifi);
+  lua_register(L, LUA_OS_DISABLE_WIFI_DEFINITION, l_OS_DisableWifi);
+  lua_register(L, LUA_OS_ENABLE_BLUETOOTH_DEFINITION, l_OS_EnableBluetooth);
+  lua_register(L, LUA_OS_GET_CONNECTED_BLUETOOTH_NAME_DEFINITION, l_OS_GetConnectedBluetoothName);
+  lua_register(L, LUA_OS_DISABLE_BLUETOOTH_DEFINITION, l_OS_DisableBluetooth);
+  lua_register(L, LUA_DISPLAY_DRAW_RECT_DEFINITION, l_drawRect);
+  lua_register(L, LUA_DISPLAY_DRAW_ELIPSE_DEFINITION, l_drawElipse);
+  lua_register(L, LUA_DISPLAY_DRAW_ARC_DEFINITION, l_drawArc);
+  lua_register(L, LUA_DISPLAY_DRAW_POLIGON_DEFINITION, l_drawPoligon);
+  lua_register(L, LUA_DISPLAY_DRAW_LINE_DEFINITION, l_drawLine);
+  lua_register(L, LUA_OS_GET_FOUND_WIFI_NETWORKS_DEFINITION, l_OS_GetFoundWifiNetworks);
+  lua_register(L, LUA_OS_FORGET_WIFI_DEFINITION, l_OS_ForgetWifi);
+  lua_register(L, LUA_OS_CONNECT_WIFI_DEFINITION, l_OS_ConnectWifi);
+  lua_register(L, LUA_OS_GET_WIFI_STATUS_DEFINITION, l_OS_GetWifiStatus);
+  lua_register(L, LUA_OS_GET_CONNECTED_WIFI_SSID_DEFINITION, l_OS_GetConnectedWifiSSID);
+  lua_register(L, LUA_OS_IS_WIFI_SCANNING_DEFINITION, l_OS_IsWifiScanning);
 }
 
 // ===== Task Lua (Core 1) =====
@@ -2175,6 +3425,9 @@ void setup() {
 
   bleMouseBegin();
   Serial.printf("BLE Mouse Started\n");
+
+  wifiManagerBegin();
+  Serial.printf("Wifi Manager Started\n");
 
   kernelServicesBegin();
   Serial.printf("Kernel Services Started\n");
