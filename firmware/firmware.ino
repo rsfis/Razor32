@@ -7,6 +7,9 @@
 #include <WiFi.h>
 #include <NimBLEDevice.h>
 #include "time.h"
+#include <vector>
+#include <string>
+#include <freertos/semphr.h>
 
 //Keys Pins (matriz 3 linhas x 10 colunas)
 //Y1   8
@@ -29,6 +32,10 @@
 #define LUA_TASK_STACK 20000
 
 #define SD_CS 4
+
+// KEYBOARD MATRIX SIZE (#define, e não const int, pra já existir quando a IDE gerar os protótipos das funções)
+#define KB_ROWS 3
+#define KB_COLS 10
 
 #define LUA_SPRITE_DEFINITION "Display.Sprite"
 #define LUA_CLEAR_SCREEN_DEFINITION "Display_ClearScreen"
@@ -63,6 +70,16 @@
 #define LUA_OS_IS_MOUSE2_PRESSED_DEFINITION "OS_IsMouse2Pressed"
 #define LUA_OS_GET_MOUSE_SCROLL_DELTA_DEFINITION "OS_GetMouseScrollDelta"
 #define LUA_OS_UPDATE_MOUSE_TASK_DEFINITION "OS_UpdateMouseTask"
+#define LUA_OS_IS_WIFI_ENABLED_DEFINITION "OS_IsWifiEnabled"
+#define LUA_OS_IS_BLUETOOTH_ENABLED_DEFINITION "OS_IsBluetoothEnabled"
+
+// ===== WIFI / BLUETOOTH TOGGLE =====
+// Nomes das teclas no kbLayout (tratadas só pelo kernel, o Lua nunca recebe elas)
+#define KEY_WIFI_TOGGLE "WifiToggle"
+#define KEY_BLUETOOTH_TOGGLE "BluetoothToggle"
+#define TOGGLE_KEY_COOLDOWN_MS 2000   // timer de utilização das duas teclas
+#define KERNEL_KEY_DEBUG 1            // 1 = imprime no Serial as teclas que o kernel vê (pra diagnóstico)
+#define TOAST_DURATION_MS 1500        // tempo da notificação rápida na tela
 
 const char* ntpServer = "pool.ntp.org";
 long gmtOffset_sec = -3 * 3600;  // UTC-3
@@ -73,6 +90,13 @@ StaticJsonDocument<1024> SystemConfiguration;
 StaticJsonDocument<1024> UserConfiguration;
 
 struct Sprite;
+
+// ===== KERNEL SERVICES (forward declarations) =====
+void kernelLuaCheckpoint();                 // ponto onde a task Lua pode ser pausada pelo kernel
+void kernelDrawToastOverlay();              // desenha a notificação por cima da tela
+void kernelShowToast(const char* msg);
+bool kernelAskConnectBluetooth(const char* name, const char* addr);
+volatile bool toastActive = false;
 
 // ===== Lua headers =====
 extern "C" {
@@ -531,8 +555,14 @@ int l_updateScreen(lua_State* L){
   // Se pushRect não é válido e já houve push antes, nada mudou desde o
   // último update -- não há necessidade de gastar SPI reenviando a mesma coisa.
 
+  // Notificação ativa: redesenha por cima, senão um push que cruze a área dela apagaria o aviso
+  if (toastActive) kernelDrawToastOverlay();
+
   frameDirtyPrev = frameDirtyAccum;
   frameDirtyAccum = DirtyRect();
+
+  // Frame completo e tela em sincronia: momento seguro pro kernel pausar a task Lua
+  kernelLuaCheckpoint();
   return 0;
 }
 
@@ -677,6 +707,39 @@ static NimBLEAddress bleTargetAddr;
 static volatile bool bleFound = false;
 static volatile bool bleDisconnected = false;
 
+volatile bool bluetoothEnabled = false;   // estado inicial do Bluetooth (true = igual ao comportamento anterior)
+static bool bleStackUp = false;
+static std::string bleTargetName;
+
+// Blacklist: dispositivos recusados com "N". Só é esvaziada quando o Bluetooth é desligado/ligado.
+static std::vector<std::string> bleBlacklist;
+static SemaphoreHandle_t bleBlacklistMutex = nullptr;
+
+static bool bleIsBlacklisted(const std::string& addr) {
+  bool found = false;
+  if (bleBlacklistMutex && xSemaphoreTake(bleBlacklistMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    for (auto& a : bleBlacklist) {
+      if (a == addr) { found = true; break; }
+    }
+    xSemaphoreGive(bleBlacklistMutex);
+  }
+  return found;
+}
+
+static void bleBlacklistAdd(const std::string& addr) {
+  if (bleBlacklistMutex && xSemaphoreTake(bleBlacklistMutex, portMAX_DELAY) == pdTRUE) {
+    bleBlacklist.push_back(addr);
+    xSemaphoreGive(bleBlacklistMutex);
+  }
+}
+
+static void bleBlacklistClear() {
+  if (bleBlacklistMutex && xSemaphoreTake(bleBlacklistMutex, portMAX_DELAY) == pdTRUE) {
+    bleBlacklist.clear();
+    xSemaphoreGive(bleBlacklistMutex);
+  }
+}
+
 // Chega um relatório do mouse
 static void bleMouseNotify(NimBLERemoteCharacteristic* chr, uint8_t* d, size_t len, bool isNotify) {
 #if BLE_MOUSE_DEBUG
@@ -730,7 +793,8 @@ static MouseClientCb bleClientCb;
 
 class MouseScanCb : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice* dev) override {
-    if (bleFound) return;
+    // Já tem mouse conectado (ou BT desligado): não procura nem atualiza mais nada
+    if (bleFound || mouseConnected || !bluetoothEnabled) return;
 
     std::string name = dev->getName();
     bool hasHid = dev->isAdvertisingService(NimBLEUUID((uint16_t)0x1812));
@@ -745,10 +809,14 @@ class MouseScanCb : public NimBLEScanCallbacks {
     }
     if (!match) return;
 
+    // Recusado antes (N): ignora até desligar e ligar o Bluetooth
+    std::string addr = dev->getAddress().toString();
+    if (bleIsBlacklisted(addr)) return;
+
     bleTargetAddr = dev->getAddress();
+    bleTargetName = name;
     bleFound = true;
-    Serial.printf("[BLE] Mouse candidate: '%s' (%s)\n",
-                  name.c_str(), dev->getAddress().toString().c_str());
+    Serial.printf("[BLE] Mouse candidate: '%s' (%s)\n", name.c_str(), addr.c_str());
     NimBLEDevice::getScan()->stop();
   }
 };
@@ -818,8 +886,7 @@ static bool bleConnectMouse() {
   return true;
 }
 
-// Task de fundo: procura o mouse, conecta e reconecta se cair
-static void bleMouseTask(void* arg) {
+static void bleStackStart() {
   NimBLEDevice::init("RazorOS");
   NimBLEDevice::setSecurityAuth(true, false, true);               // bonding, sem MITM, Secure Connections
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);      // "Just Works"
@@ -830,7 +897,44 @@ static void bleMouseTask(void* arg) {
   scan->setInterval(100);
   scan->setWindow(99);
 
+  bleClient = nullptr;
+  bleDisconnected = false;
+  bleFound = false;
+  bleStackUp = true;
+  Serial.println("[BLE] Bluetooth ON");
+}
+
+static void bleStackStop() {
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  if (scan->isScanning()) scan->stop();
+  if (bleClient && bleClient->isConnected()) bleClient->disconnect();
+
+  mouseConnected = false;
+  portENTER_CRITICAL(&mouseMux);
+  mouseBtn1 = false;
+  mouseBtn2 = false;
+  mouseScroll = 0;
+  portEXIT_CRITICAL(&mouseMux);
+
+  NimBLEDevice::deinit(true);   // libera client/scan; o pareamento (bond) continua na NVS
+  bleClient = nullptr;
+  bleFound = false;
+  bleStackUp = false;
+  Serial.println("[BLE] Bluetooth OFF");
+}
+
+// Task de fundo: liga/desliga a pilha BLE, procura mouse, pergunta pro usuário, conecta e reconecta se cair
+static void bleMouseTask(void* arg) {
   for (;;) {
+    // ----- Bluetooth desligado -----
+    if (!bluetoothEnabled) {
+      if (bleStackUp) bleStackStop();
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+    if (!bleStackUp) bleStackStart();
+
+    // ----- Mouse conectado: NÃO procura nem atualiza lista de dispositivos -----
     if (mouseConnected) {
       if (bleDisconnected || !bleClient || !bleClient->isConnected()) {
         mouseConnected = false;
@@ -845,21 +949,40 @@ static void bleMouseTask(void* arg) {
       continue;
     }
 
+    // ----- Procurando -----
+    NimBLEScan* scan = NimBLEDevice::getScan();
     bleFound = false;
     scan->start(5000, false);                // 5 s, não bloqueia
 
     uint32_t t0 = millis();
-    while (!bleFound && (millis() - t0) < 6000) vTaskDelay(pdMS_TO_TICKS(50));
+    while (!bleFound && bluetoothEnabled && (millis() - t0) < 6000) vTaskDelay(pdMS_TO_TICKS(50));
     scan->stop();
 
+    if (!bluetoothEnabled) continue;         // o topo do loop desliga a pilha
+
     if (bleFound) {
-      bleConnectMouse();
+      std::string addr = bleTargetAddr.toString();
+      std::string name = bleTargetName;
+
+      // O kernel pausa o Lua e mostra o dialog; só volta quando o usuário apertar S ou N
+      bool wants = kernelAskConnectBluetooth(name.c_str(), addr.c_str());
+      if (!bluetoothEnabled) continue;
+
+      if (wants) {
+        if (!bleConnectMouse()) {
+          vTaskDelay(pdMS_TO_TICKS(10000));  // falhou: espera antes de oferecer de novo
+        }
+      } else {
+        bleBlacklistAdd(addr);
+        Serial.printf("[BLE] %s blacklisted until Bluetooth is toggled\n", addr.c_str());
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(500));
   }
 }
 
 void bleMouseBegin() {
+  if (!bleBlacklistMutex) bleBlacklistMutex = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(bleMouseTask, "BLE_MOUSE", 8192, NULL, 1, NULL, 0);
   Serial.println("BLE Mouse task started");
 }
@@ -921,8 +1044,7 @@ int l_OS_GetMouseScrollDelta(lua_State* L) {
 }
 
 // ===== KEYBOARD (matriz 3x10 + 2 páginas; a 2ª muda com CAPSLOCK) =====
-const int KB_ROWS = 3;
-const int KB_COLS = 10;
+// KB_ROWS / KB_COLS agora são #define no topo do arquivo (ver "KEYBOARD MATRIX SIZE")
 
 const int kbRowPins[KB_ROWS] = {8, 21, 41};                           // Y1..Y3 (INPUT_PULLUP)
 const int kbColPins[KB_COLS] = {48, 45, 17, 16, 40, 18, 42, 39, 47, 7}; // X1..X10
@@ -944,17 +1066,18 @@ const char* const kbLayout[3][KB_ROWS][KB_COLS] = {
   },
   {
     {"ESC", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9"},
-    {"", "", "", "", "", "", "", "", "", "RETURN"},
+    {"CAPSLOCK", "", "", "", "", "", "WifiToggle", "BluetoothToggle", "", "RETURN"},
     {"HOME", "", "", "[", "]", "", "", "", "fun", "ENTER"}
   }
 };
 
 bool kbMatrix[KB_ROWS][KB_COLS];       // [linha][coluna], true = pressionada
-uint8_t kbLayer = 0;                   // página atual (0 ou 1)
-bool kbCapsLock = false;               // CAPSLOCK ativo -> letras maiúsculas
+volatile uint8_t kbLayer = 0;                   // página atual (0 ou 1)
+volatile bool kbCapsLock = false;               // CAPSLOCK ativo -> letras maiúsculas
 volatile uint32_t kbDelayMs = 300;     // delay global anti-flood (ms)
 uint32_t kbLastAcceptMs = 0;
 bool kbTimerStarted = false;
+SemaphoreHandle_t kbScanMutex = nullptr;   // o Lua e a task do kernel escaneiam a mesma matriz
 
 // Camada realmente usada em kbLayout:
 // página 0 -> tabela 0
@@ -964,7 +1087,13 @@ uint8_t keyboardEffectiveLayer() {
   return kbLayer;
 }
 
+// Teclas que pertencem ao kernel (nunca chegam ao Lua)
+static inline bool kernelIsReservedKey(const char* name) {
+  return strcmp(name, KEY_WIFI_TOGGLE) == 0 || strcmp(name, KEY_BLUETOOTH_TOGGLE) == 0;
+}
+
 void keyboardInit() {
+  if (!kbScanMutex) kbScanMutex = xSemaphoreCreateMutex();
   for (int l = 0; l < KB_ROWS; l++) pinMode(kbRowPins[l], INPUT_PULLUP);
   // Colunas começam em alta impedância
   for (int c = 0; c < KB_COLS; c++) pinMode(kbColPins[c], INPUT);
@@ -981,18 +1110,27 @@ void keyboardStartTimer() {
   kbTimerStarted = true;
 }
 
-void keyboardScan() {
+// Escaneia a matriz para dentro de 'm' (protegido por mutex: Lua e kernel podem escanear ao mesmo tempo)
+void keyboardScanInto(bool m[KB_ROWS][KB_COLS]) {
+  if (kbScanMutex) xSemaphoreTake(kbScanMutex, portMAX_DELAY);
+
   for (int c = 0; c < KB_COLS; c++) {
     pinMode(kbColPins[c], OUTPUT);
     digitalWrite(kbColPins[c], LOW);
     delayMicroseconds(5);
 
     for (int l = 0; l < KB_ROWS; l++) {
-      kbMatrix[l][c] = (digitalRead(kbRowPins[l]) == LOW);
+      m[l][c] = (digitalRead(kbRowPins[l]) == LOW);
     }
 
     pinMode(kbColPins[c], INPUT);
   }
+
+  if (kbScanMutex) xSemaphoreGive(kbScanMutex);
+}
+
+void keyboardScan() {
+  keyboardScanInto(kbMatrix);
 }
 
 // Posição física da tecla FUNCTION (a mesma em todas as páginas)
@@ -1001,25 +1139,14 @@ bool keyboardIsFunctionCell(int layer, int l, int c) {
   return (l == 2 && c == 8);
 }
 
-// Se FUNCTION está pressionada: alterna entre as duas páginas (0 <-> 1), inicia o timer
-// e retorna true (a tecla é consumida, não é reportada ao Lua).
+// true se FUNCTION (ou CAPSLOCK, na página 2) está pressionada: a tecla é consumida e não é
+// reportada ao Lua. Quem troca a página / liga o CAPSLOCK é a task do kernel (kernelTask),
+// que escaneia o teclado o tempo todo, mesmo quando o app Lua não lê o teclado.
 bool keyboardHandleFunction() {
   for (int c = 0; c < KB_COLS; c++) {
-    if (keyboardIsFunctionCell(kbLayer, 2, c) && kbMatrix[2][c]) {
-      kbLayer = (kbLayer + 1) % 2;
-      keyboardStartTimer();
-      return true;
-    }
+    if (keyboardIsFunctionCell(kbLayer, 2, c) && kbMatrix[2][c]) return true;
   }
-
-  // CAPSLOCK (página 1, linha 1, coluna 0): liga/desliga maiúsculas.
-  // Usa kbLayer (e não a camada efetiva), então continua funcionando
-  // com a terceira tabela ativa, permitindo desligar o CAPSLOCK.
-  if (kbLayer == 1 && kbMatrix[1][0]) {
-    kbCapsLock = !kbCapsLock;
-    keyboardStartTimer();
-    return true;
-  }
+  if (kbLayer == 1 && kbMatrix[1][0]) return true;
   return false;
 }
 
@@ -1045,6 +1172,8 @@ int l_OS_SetKeyboardDelay(lua_State* L) {
 // OS_GetPressedKey() -> string | nil
 // Retorna o nome da tecla pressionada (apenas uma) ou nil se nenhuma / timer em andamento.
 int l_OS_GetPressedKey(lua_State* L) {
+  kernelLuaCheckpoint();
+
   if (!keyboardTimerReady()) {
     lua_pushnil(L);
     return 1;
@@ -1060,7 +1189,7 @@ int l_OS_GetPressedKey(lua_State* L) {
   for (int l = 0; l < KB_ROWS; l++) {
     for (int c = 0; c < KB_COLS; c++) {
       const char* name = kbLayout[keyboardEffectiveLayer()][l][c];
-      if (name[0] != '\0' && kbMatrix[l][c]) {
+      if (name[0] != '\0' && kbMatrix[l][c] && !kernelIsReservedKey(name)) {
         keyboardStartTimer();
         char caseBuf[2];
         lua_pushstring(L, keyboardApplyCase(name, caseBuf));
@@ -1079,6 +1208,8 @@ int l_OS_GetPressedKey(lua_State* L) {
 int l_OS_IsKeyPressed(lua_State* L) {
   const char* key = luaL_checkstring(L, 1);
 
+  kernelLuaCheckpoint();
+
   if (!keyboardTimerReady()) {
     lua_pushboolean(L, 0);
     return 1;
@@ -1094,7 +1225,7 @@ int l_OS_IsKeyPressed(lua_State* L) {
   for (int l = 0; l < KB_ROWS; l++) {
     for (int c = 0; c < KB_COLS; c++) {
       const char* name = kbLayout[keyboardEffectiveLayer()][l][c];
-      if (name[0] != '\0' && kbMatrix[l][c] && strcasecmp(name, key) == 0) {
+      if (name[0] != '\0' && kbMatrix[l][c] && !kernelIsReservedKey(name) && strcasecmp(name, key) == 0) {
         keyboardStartTimer();
         lua_pushboolean(L, 1);
         return 1;
@@ -1106,8 +1237,288 @@ int l_OS_IsKeyPressed(lua_State* L) {
   return 1;
 }
 
+// ===== KERNEL SERVICES: pausa do Lua, notificação, dialog BT, toggles Wi-Fi/BT =====
+static TaskHandle_t luaTaskHandle = nullptr;
+static volatile bool luaTaskAlive = false;
+static volatile bool luaPauseReq = false;
+static volatile bool luaParked = false;
+
+// Chamado pela task Lua em pontos seguros (sem segurar SPI/SD). Se o kernel pediu pausa, bloqueia aqui.
+void kernelLuaCheckpoint() {
+  if (!luaPauseReq) return;
+  if (xTaskGetCurrentTaskHandle() != luaTaskHandle) return;
+
+  luaParked = true;
+  while (luaPauseReq) vTaskDelay(pdMS_TO_TICKS(5));
+  luaParked = false;
+}
+
+static void kernelPauseLua() {
+  luaPauseReq = true;
+  if (!luaTaskAlive) return;
+
+  // Espera o Lua chegar no próximo checkpoint (não trava pra sempre se o Lua estiver numa conta longa)
+  uint32_t t0 = millis();
+  while (!luaParked && (millis() - t0) < 400) vTaskDelay(pdMS_TO_TICKS(2));
+}
+
+static void kernelResumeLua() {
+  luaPauseReq = false;
+  uint32_t t0 = millis();
+  while (luaParked && (millis() - t0) < 50) vTaskDelay(pdMS_TO_TICKS(1));
+}
+
+// ----- Notificação rápida (toast) -----
+static const int TOAST_X = 140, TOAST_Y = 6, TOAST_W = 200, TOAST_H = 26;
+static char toastText[40] = "";
+static volatile uint32_t toastUntilMs = 0;
+
+void kernelDrawToastOverlay() {
+  uint16_t bg = tft.color565(25, 25, 25);
+  tft.fillRoundRect(TOAST_X, TOAST_Y, TOAST_W, TOAST_H, 6, bg);
+  tft.drawRoundRect(TOAST_X, TOAST_Y, TOAST_W, TOAST_H, 6, TFT_WHITE);
+  tft.setFont(&fonts::Font2);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, bg);
+  tft.setTextDatum(textdatum_t::middle_center);
+  tft.drawString(toastText, TOAST_X + TOAST_W / 2, TOAST_Y + TOAST_H / 2);
+}
+
+void kernelShowToast(const char* msg) {
+  kernelPauseLua();
+  strlcpy(toastText, msg, sizeof(toastText));
+  toastUntilMs = millis() + TOAST_DURATION_MS;
+  toastActive = true;
+  kernelDrawToastOverlay();
+  kernelResumeLua();
+}
+
+// Some com a notificação: repõe a área a partir do frame do Lua
+static void kernelHideToast() {
+  kernelPauseLua();
+  toastActive = false;
+  frame.setClipRect(TOAST_X, TOAST_Y, TOAST_W, TOAST_H);
+  frame.pushSprite(0, 0);
+  frame.setClipRect(0, 0, frame.width(), frame.height());
+  kernelResumeLua();
+}
+
+// ----- Wi-Fi / Bluetooth -----
+volatile bool wifiEnabled = false;   // o syncTime() já deixa o Wi-Fi desligado depois do boot
+
+static void wifiApply(bool on) {
+  if (on) {
+    const char* ssid = SystemConfiguration["Wifi"]["ssid"] | "";
+    const char* password = SystemConfiguration["Wifi"]["password"] | "";
+    WiFi.mode(WIFI_STA);
+    if (strlen(ssid) > 0) WiFi.begin(ssid, password);   // não bloqueia
+    wifiEnabled = true;
+    Serial.println("[WIFI] ON");
+  } else {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    wifiEnabled = false;
+    Serial.println("[WIFI] OFF");
+  }
+}
+
+static void bluetoothApply(bool on) {
+  // Ligar ou desligar sempre zera a blacklist (nova chance de autorizar dispositivos recusados)
+  bleBlacklistClear();
+  if (!on) mouseConnected = false;
+  bluetoothEnabled = on;   // a task BLE liga/desliga a pilha e a busca
+}
+
+int l_OS_IsWifiEnabled(lua_State* L) {
+  lua_pushboolean(L, wifiEnabled);
+  return 1;
+}
+
+int l_OS_IsBluetoothEnabled(lua_State* L) {
+  lua_pushboolean(L, bluetoothEnabled);
+  return 1;
+}
+
+// ----- Dialog "Conectar ao mouse?" (S / N) -----
+static volatile int bleAskState = 0;   // 0 = nada, 1 = pergunta pendente, 2 = S, 3 = N
+static char bleAskName[40] = "";
+static char bleAskAddr[20] = "";
+
+// Chamada pela task BLE: bloqueia até o kernel receber S ou N
+bool kernelAskConnectBluetooth(const char* name, const char* addr) {
+  strlcpy(bleAskName, (name && name[0]) ? name : "(sem nome)", sizeof(bleAskName));
+  strlcpy(bleAskAddr, addr ? addr : "", sizeof(bleAskAddr));
+  bleAskState = 1;
+  while (bleAskState == 1) vTaskDelay(pdMS_TO_TICKS(20));
+  bool yes = (bleAskState == 2);
+  bleAskState = 0;
+  return yes;
+}
+
+// Lê a posição física das teclas S/N da página 1 (funciona em qualquer página/CAPSLOCK)
+static bool kbKeyDownLayer0(bool m[][KB_COLS], const char* key) {
+  for (int l = 0; l < KB_ROWS; l++) {
+    for (int c = 0; c < KB_COLS; c++) {
+      if (strcasecmp(kbLayout[0][l][c], key) == 0) return m[l][c];
+    }
+  }
+  return false;
+}
+
+static void drawBluetoothDialog(const char* name, const char* addr) {
+  const int W = 380, H = 130;
+  const int x = (tft.width() - W) / 2;
+  const int y = (tft.height() - H) / 2;
+  const int cx = x + W / 2;
+  uint16_t bg = tft.color565(20, 20, 20);
+
+  tft.fillRoundRect(x, y, W, H, 8, bg);
+  tft.drawRoundRect(x, y, W, H, 8, TFT_WHITE);
+  tft.setFont(&fonts::Font2);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, bg);
+  tft.setTextDatum(textdatum_t::top_center);
+  tft.drawString("Mouse Bluetooth encontrado", cx, y + 12);
+  tft.drawString("Conectar a este dispositivo?", cx, y + 32);
+  tft.drawString(name, cx, y + 58);
+  tft.drawString(addr, cx, y + 76);
+  tft.drawString("[S] Sim        [N] Nao", cx, y + 102);
+}
+
+static void kernelRunBluetoothDialog() {
+  char name[40], addr[20];
+  strlcpy(name, bleAskName, sizeof(name));
+  strlcpy(addr, bleAskAddr, sizeof(addr));
+
+  kernelPauseLua();
+  toastActive = false;
+  drawBluetoothDialog(name, addr);
+
+  bool m[KB_ROWS][KB_COLS];
+  bool answer = false;
+  bool armed = false;   // só aceita S/N depois de ver as duas soltas (evita responder com tecla já apertada)
+
+  for (;;) {
+    keyboardScanInto(m);
+    bool s = kbKeyDownLayer0(m, "S");
+    bool n = kbKeyDownLayer0(m, "N");
+
+    if (!s && !n) {
+      armed = true;
+    } else if (armed) {
+      answer = s;   // S = sim, N = não
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+
+  // Espera soltar a tecla pra ela não vazar pro Lua quando ele voltar
+  uint32_t t0 = millis();
+  while ((millis() - t0) < 1500) {
+    keyboardScanInto(m);
+    if (!kbKeyDownLayer0(m, "S") && !kbKeyDownLayer0(m, "N")) break;
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+
+  // Restaura a tela inteira a partir do frame do Lua
+  frame.setClipRect(0, 0, frame.width(), frame.height());
+  frame.pushSprite(0, 0);
+
+  kernelResumeLua();
+  bleAskState = answer ? 2 : 3;
+}
+
+// ----- Task do kernel: teclas WifiToggle/BluetoothToggle, toast e dialog -----
+static void kernelTask(void* arg) {
+  bool m[KB_ROWS][KB_COLS];
+  bool wifiHeld = false, btHeld = false;
+  bool funcHeld = false, capsHeld = false;
+  bool wifiUsed = false, btUsed = false;
+  uint32_t wifiLastMs = 0, btLastMs = 0;
+#if KERNEL_KEY_DEBUG
+  bool dbgPrev[KB_ROWS][KB_COLS] = {};
+#endif
+
+  for (;;) {
+    if (bleAskState == 1) {
+      kernelRunBluetoothDialog();
+    }
+
+    if (toastActive && (int32_t)(millis() - toastUntilMs) >= 0) {
+      kernelHideToast();
+    }
+
+    keyboardScanInto(m);
+
+    // FUNCTION: alterna página 1 <-> 2 | CAPSLOCK (só na página 2): liga/desliga maiúsculas.
+    // Uma ação por aperto (detecta a borda), independente do app Lua estar lendo teclado.
+    bool funcDown = false;
+    for (int c = 0; c < KB_COLS; c++) {
+      if (keyboardIsFunctionCell(kbLayer, 2, c) && m[2][c]) funcDown = true;
+    }
+    if (funcDown && !funcHeld) kbLayer = (kbLayer + 1) % 2;
+    funcHeld = funcDown;
+
+    bool capsDown = (kbLayer == 1) && m[1][0];
+    if (capsDown && !capsHeld) kbCapsLock = !kbCapsLock;
+    capsHeld = capsDown;
+
+    const uint8_t layer = keyboardEffectiveLayer();
+    bool wifiDown = false, btDown = false;
+
+    for (int l = 0; l < KB_ROWS; l++) {
+      for (int c = 0; c < KB_COLS; c++) {
+        if (!m[l][c]) continue;
+        const char* name = kbLayout[layer][l][c];
+#if KERNEL_KEY_DEBUG
+        // Imprime cada tecla nova que o kernel enxerga (mostra em que camada ele acha que está)
+        if (!dbgPrev[l][c]) {
+          Serial.printf("[KERNEL KEY] cell(%d,%d) layer=%d kbLayer=%d caps=%d name='%s'\n",
+                        l, c, layer, (int)kbLayer, (int)kbCapsLock, name);
+        }
+#endif
+        if (strcmp(name, KEY_WIFI_TOGGLE) == 0) wifiDown = true;
+        else if (strcmp(name, KEY_BLUETOOTH_TOGGLE) == 0) btDown = true;
+      }
+    }
+
+#if KERNEL_KEY_DEBUG
+    memcpy(dbgPrev, m, sizeof(dbgPrev));
+#endif
+    uint32_t now = millis();
+
+    // Cada tecla: 1 ação por aperto e timer de 2 s entre usos
+    if (wifiDown && !wifiHeld && (!wifiUsed || (now - wifiLastMs) >= TOGGLE_KEY_COOLDOWN_MS)) {
+      wifiUsed = true;
+      wifiLastMs = now;
+      bool on = !wifiEnabled;
+      wifiApply(on);
+      kernelShowToast(on ? "Wi-Fi ativado" : "Wi-Fi desativado");
+    }
+    wifiHeld = wifiDown;
+
+    if (btDown && !btHeld && (!btUsed || (now - btLastMs) >= TOGGLE_KEY_COOLDOWN_MS)) {
+      btUsed = true;
+      btLastMs = now;
+      bool on = !bluetoothEnabled;
+      bluetoothApply(on);
+      kernelShowToast(on ? "Bluetooth ativado" : "Bluetooth desativado");
+    }
+    btHeld = btDown;
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+void kernelServicesBegin() {
+  xTaskCreatePinnedToCore(kernelTask, "KERNEL", 8192, NULL, 2, NULL, 0);
+  Serial.println("Kernel services task started");
+}
+
 int l_OS_Sleep(lua_State* L){
+  kernelLuaCheckpoint();
   delay(luaL_checkinteger(L, 1));
+  kernelLuaCheckpoint();
   return 0;
 }
 
@@ -1512,6 +1923,8 @@ void registerApis(lua_State* L) {
   lua_register(L, LUA_OS_IS_MOUSE2_PRESSED_DEFINITION, l_OS_IsMouse2Pressed);
   lua_register(L, LUA_OS_GET_MOUSE_SCROLL_DELTA_DEFINITION, l_OS_GetMouseScrollDelta);
   lua_register(L, LUA_OS_UPDATE_MOUSE_TASK_DEFINITION, l_OS_UpdateMouseTask);
+  lua_register(L, LUA_OS_IS_WIFI_ENABLED_DEFINITION, l_OS_IsWifiEnabled);
+  lua_register(L, LUA_OS_IS_BLUETOOTH_ENABLED_DEFINITION, l_OS_IsBluetoothEnabled);
 }
 
 // ===== Task Lua (Core 1) =====
@@ -1553,11 +1966,15 @@ void taskLuaApp(void* arg) {
   buffer[size] = '\0';
   f.close();
 
+  luaTaskHandle = xTaskGetCurrentTaskHandle();
+  luaTaskAlive = true;
+
   // EXECUTA ANTES DE DAR FREE
   if (luaL_dostring(L, buffer) != LUA_OK) {
     Serial.printf("LUA ERROR: %s\n", lua_tostring(L, -1));
   }
 
+  luaTaskAlive = false;
   free(buffer);
 
   // LOOP
@@ -1757,7 +2174,10 @@ void setup() {
   Serial.printf("Keyboard Started\n");
 
   bleMouseBegin();
-  Serial.printf("USB Host Started\n");
+  Serial.printf("BLE Mouse Started\n");
+
+  kernelServicesBegin();
+  Serial.printf("Kernel Services Started\n");
 
   Serial.printf("Starting LUA VM\n");
 
