@@ -1,0 +1,7 @@
+Always open the script using the CMD
+Execute: python glb_to_rzobj.py
+
+Download these libs:
+PIL
+pygltflib
+numpy
