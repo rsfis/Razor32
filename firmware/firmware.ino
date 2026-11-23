@@ -89,6 +89,7 @@
 #define LUA_OS_IS_MOUSE1_PRESSED_DEFINITION "OS_IsMouse1Pressed"
 #define LUA_OS_IS_MOUSE2_PRESSED_DEFINITION "OS_IsMouse2Pressed"
 #define LUA_OS_GET_MOUSE_SCROLL_DELTA_DEFINITION "OS_GetMouseScrollDelta"
+#define LUA_OS_GET_MOUSE_DELTA_DEFINITION "OS_GetMouseDelta"
 #define LUA_OS_UPDATE_MOUSE_TASK_DEFINITION "OS_UpdateMouseTask"
 #define LUA_OS_IS_WIFI_ENABLED_DEFINITION "OS_IsWifiEnabled"
 #define LUA_OS_IS_BLUETOOTH_ENABLED_DEFINITION "OS_IsBluetoothEnabled"
@@ -2238,6 +2239,8 @@ int  mouseY = 160;
 bool mouseBtn1 = false;            // esquerdo
 bool mouseBtn2 = false;            // direito
 int  mouseScroll = 0;              // acumulado desde a última leitura
+int  mouseDX = 0;                  // movimento bruto acumulado desde a última leitura (sem limite de tela)
+int  mouseDY = 0;
 volatile bool mouseConnected = false;
 
 static NimBLEClient* bleClient = nullptr;
@@ -2319,6 +2322,8 @@ static void bleMouseNotify(NimBLERemoteCharacteristic* chr, uint8_t* d, size_t l
   if (mouseY > tft.height() - 1) mouseY = tft.height() - 1;
 
   mouseScroll += wh;
+  mouseDX += dx;
+  mouseDY += dy;
 
   portEXIT_CRITICAL(&mouseMux);
 }
@@ -2571,6 +2576,19 @@ int l_OS_IsMouse2Pressed(lua_State* L) {
   portEXIT_CRITICAL(&mouseMux);
   lua_pushboolean(L, b);
   return 1;
+}
+
+// OS_GetMouseDelta() -> dx, dy (movimento bruto acumulado desde a última chamada; zera ao ler)
+// Diferente de OS_GetMousePosition, não trava nas bordas da tela: ideal para câmera livre.
+int l_OS_GetMouseDelta(lua_State* L) {
+  portENTER_CRITICAL(&mouseMux);
+  int dx = mouseDX, dy = mouseDY;
+  mouseDX = 0;
+  mouseDY = 0;
+  portEXIT_CRITICAL(&mouseMux);
+  lua_pushinteger(L, dx);
+  lua_pushinteger(L, dy);
+  return 2;
 }
 
 // OS_GetMouseScrollDelta() -> integer (acumulado desde a última chamada; zera ao ler)
@@ -5667,7 +5685,7 @@ static TaskHandle_t gWorkerTask = nullptr;
 
 // ---- PROFILER (R3D_PROFILE 1): imprime no Serial, 1x por segundo, onde o tempo de cada quadro 3D vai ----
 #ifndef R3D_PROFILE
-#define R3D_PROFILE 1
+#define R3D_PROFILE 0
 #endif
 #if R3D_PROFILE
 static std::atomic<int> gProfBands[2];          // faixas desenhadas por contexto (0 = task Lua, 1 = worker do núcleo 0)
@@ -6915,6 +6933,7 @@ void registerApis(lua_State* L) {
   lua_register(L, LUA_OS_IS_MOUSE1_PRESSED_DEFINITION, l_OS_IsMouse1Pressed);
   lua_register(L, LUA_OS_IS_MOUSE2_PRESSED_DEFINITION, l_OS_IsMouse2Pressed);
   lua_register(L, LUA_OS_GET_MOUSE_SCROLL_DELTA_DEFINITION, l_OS_GetMouseScrollDelta);
+  lua_register(L, LUA_OS_GET_MOUSE_DELTA_DEFINITION, l_OS_GetMouseDelta);
   lua_register(L, LUA_OS_UPDATE_MOUSE_TASK_DEFINITION, l_OS_UpdateMouseTask);
   lua_register(L, LUA_OS_IS_WIFI_ENABLED_DEFINITION, l_OS_IsWifiEnabled);
   lua_register(L, LUA_OS_IS_BLUETOOTH_ENABLED_DEFINITION, l_OS_IsBluetoothEnabled);
