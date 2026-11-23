@@ -4615,6 +4615,14 @@ struct Model {
   bool      animLoop = true, animPlay = false, blending = false;
   float     blendT = 0.0f, blendDur = 0.0f;
 
+  // ---- instâncias ----
+  // Uma instância é um Model "clone": compartilha (somente leitura) vértices, triângulos, texturas, esqueleto e clipes
+  // com o modelo original e tem só o que muda por instância: transformação, estado de animação, vértices skinned,
+  // AABBs dos meshlets (cópia própria se skinned) e as listas de visibilidade/ordem.
+  bool isClone = false;
+  bool ownMl   = false;          // ml é cópia própria (modelo skinned) e deve ser liberado
+  bool isVisible = true;         // false => o draw() ignora este modelo/instância
+
   Vec3 position;
   Vec3 rotation;
   Vec3 scale;
@@ -4634,6 +4642,7 @@ struct Model {
   // SEGURANÇA: só chame fora de um quadro em andamento (ex.: no loop(), antes de renderScene, ou dentro
   // do próprio loop depois do xQueueReceive) — os 2 núcleos leem esses buffers durante o render.
   void unload() {
+    if (isClone) { unloadClone(); return; }
     visCount = 0;                      // 1º: qualquer draw/prepare passa a sair cedo
     mlCount = 0;
     if (texs) {
@@ -4663,6 +4672,78 @@ struct Model {
     vskin = nullptr; vsk = nullptr; vdraw = nullptr; poolV = 0;
     bones = nullptr; boneCount = 0; clips = nullptr; clipCount = 0; keyPool = nullptr;
     animMem = nullptr; cur = from = out = pose = nullptr;
+  }
+
+  // Libera só o que pertence à instância; os dados compartilhados continuam com o modelo original.
+  void unloadClone() {
+    visCount = 0;
+    mlCount = 0;
+    if (ownMl && ml) heap_caps_free(ml);
+    if (order)   heap_caps_free(order);
+    if (skey)    heap_caps_free(skey);
+    if (vis)     heap_caps_free(vis);
+    if (vflag)   heap_caps_free(vflag);
+    if (vskin)   heap_caps_free(vskin);
+    if (animMem) heap_caps_free(animMem);
+    ml = nullptr; ownMl = false;
+    order = nullptr; skey = nullptr; vis = nullptr; vflag = nullptr;
+    vskin = nullptr; animMem = nullptr; cur = from = out = pose = nullptr;
+    vpool = nullptr; tpool = nullptr; vsk = nullptr; vdraw = nullptr; poolV = 0;
+    texs = nullptr; texCount = 0;
+    bones = nullptr; boneCount = 0; clips = nullptr; clipCount = 0; keyPool = nullptr;
+    animPlay = false; blending = false; animClip = -1; animT = 0.0f;
+    vertCount = 0; triCount = 0;
+    isClone = false;
+  }
+
+  // Vira uma instância do modelo `s` (que precisa estar carregado e não ser ele mesmo uma instância).
+  // Só aloca o estado por instância. Chame promoteFrameData() depois pra mover os arrays pequenos pra RAM interna.
+  bool cloneFrom(const Model& s) {
+    if (!s.loaded() || s.isClone) return false;
+    isClone = true;
+    vertCount = s.vertCount; triCount = s.triCount; cull = s.cull;
+    vpool = s.vpool; tpool = s.tpool; mlCount = s.mlCount; poolV = s.poolV;
+    texs = s.texs; texCount = s.texCount;
+    vsk = s.vsk; bones = s.bones; boneCount = s.boneCount;
+    memcpy(rootM, s.rootM, sizeof(rootM));
+    clips = s.clips; clipCount = s.clipCount; keyPool = s.keyPool;
+    position = {0, 0, 0}; rotation = {0, 0, 0}; scale = {1, 1, 1};
+    isVisible = true;
+
+    const size_t n = (size_t)mlCount;
+    if (s.vskin) {
+      // skinned: AABBs dos meshlets e vértices mudam com a pose => cópia própria
+      ml = (Meshlet*)allocFast(sizeof(Meshlet) * n, "meshlets (inst)", false);
+      if (!ml) { unloadClone(); return false; }
+      ownMl = true;
+      memcpy(ml, s.ml, sizeof(Meshlet) * n);
+      vskin = (Vtx*)allocFast(sizeof(Vtx) * (size_t)poolV, "vertices skin (inst)", false);
+      if (!vskin) { unloadClone(); return false; }
+      memcpy(vskin, s.vpool, sizeof(Vtx) * (size_t)poolV);
+      vdraw = vskin;
+      animMem = (float*)allocFast(sizeof(float) * (size_t)boneCount * (10 * 3 + 12), "pose/anim (inst)", true);
+      if (!animMem) { unloadClone(); return false; }
+      cur = animMem; from = cur + 10 * boneCount; out = from + 10 * boneCount; pose = out + 10 * boneCount;
+    } else {
+      ml = s.ml;                      // estático: tudo somente leitura, compartilha
+      vdraw = s.vdraw;
+    }
+
+    order = (uint16_t*)allocFast(sizeof(uint16_t) * n, "ordem (inst)", false);
+    skey  = (float*)   allocFast(sizeof(float)    * n, "chaves z (inst)", false);
+    vis   = (uint16_t*)allocFast(sizeof(uint16_t) * n, "visiveis (inst)", false);
+    vflag = (uint8_t*) allocFast(n,                    "flags vis. (inst)", false);
+    if (!vis || !vflag) { unloadClone(); return false; }
+    if (!order || !skey) {
+      if (order) heap_caps_free(order);
+      if (skey)  heap_caps_free(skey);
+      order = nullptr; skey = nullptr;
+    } else {
+      for (int i = 0; i < mlCount; ++i) order[i] = (uint16_t)i;
+    }
+
+    if (boneCount > 0) rebindPose();  // pose de repouso na instância
+    return true;
   }
 
   // Carrega do SD. Se já havia algo carregado, descarrega antes; se o load falhar, não deixa lixo alocado.
@@ -5392,12 +5473,13 @@ static int64_t gLastUs = 0;        // relógio de 64 bits (micros() de 32 bits d
 // O quadro é dividido em RENDER_BANDS faixas horizontais. Cada núcleo pega a próxima faixa livre
 // (contador atômico), limpa as linhas dela e desenha a cena inteira só naquelas linhas.
 // Núcleo ocupado com o blit => o outro simplesmente pega mais faixas (balanceamento automático).
+#define R3D_MAX_DRAW 32       // modelos/instâncias desenhados por quadro (fila de desenho)
 struct FrameJob {
   uint16_t* color;
   float nearW, depthScale;
   int n;
-  Model* model[16];
-  Mat4 mvp[16];
+  Model* model[R3D_MAX_DRAW];
+  Mat4 mvp[R3D_MAX_DRAW];
 };
 static FrameJob gJob;
 static int gBands = RENDER_BANDS;     // faixas do quadro atual: RENDER_BANDS com worker, 1 sem (faixa serve só p/ dividir entre núcleos)
@@ -5577,7 +5659,6 @@ static bool gR3DReady = false;
 static bool gR3DAsync = false;      // true = 2 buffers de cor + tarefa de blit 3D (raster do quadro N+1 durante o SPI do N)
 static int  gR3DHeld = -1;         // buffer de cor 3D com o Lua (Render3D(false) ainda sem Composite3DToFrame)
 static int  gR3DLast = 0;           // buffer de cor do ÚLTIMO quadro renderizado (Composite3DToFrame lê daqui)
-static const int R3D_MAX_DRAW = 16;
 static Model* gR3DQueue[R3D_MAX_DRAW];
 static int gR3DQueueN = 0;
 
@@ -5685,7 +5766,7 @@ static void r3dRenderTo(uint16_t* color) {
   gJob.nearW = camera.nearZ;
   gJob.depthScale = 60000.0f * camera.nearZ;
   int n = 0;
-  for (int i = 0; i < gR3DQueueN && n < 16; ++i) {
+  for (int i = 0; i < gR3DQueueN && n < R3D_MAX_DRAW; ++i) {
     gJob.model[n] = gR3DQueue[i];
     gJob.mvp[n] = matMul(VP, gR3DQueue[i]->getModelMatrix());
     n++;
@@ -5720,10 +5801,26 @@ static void r3dPresent(uint16_t* color) {
 
 #define LUA_MODEL3D_MT "Model3D"
 #define LUA_CAMERA3D_MT "Camera3D"
+#define LUA_MODEL3D_INST_MT "Model3DInstance"
+#define LUA_MODEL3D_INSTLIST_MT "Model3DInstances"
+#define R3D_MAX_INSTANCES 32
 
 // ---- Model3D userdata: owns a heap Model* so large object is not on Lua stack ----
 struct LuaModel3D {
   Model* model;
+  Model* inst[R3D_MAX_INSTANCES];   // instâncias criadas com :createInstance() (índice Lua 0-based = índice aqui)
+  int instCount;
+};
+
+// model.instances[i] -> referência a uma instância (mantém o Model3D dono vivo via uservalue)
+struct LuaModelInst {
+  LuaModel3D* parent;
+  int index;
+};
+
+// model.instances -> lista (suporta [i] 0-based e #)
+struct LuaInstList {
+  LuaModel3D* parent;
 };
 
 
@@ -5742,16 +5839,75 @@ LuaModel3D* checkModel3D(lua_State* L, int idx) {
   return (LuaModel3D*)luaL_checkudata(L, idx, LUA_MODEL3D_MT);
 }
 
+// Aceita um Model3D OU uma instância (os mesmos métodos servem pros dois)
 Model* checkModelPtr(lua_State* L, int idx) {
+  LuaModelInst* r = (LuaModelInst*)luaL_testudata(L, idx, LUA_MODEL3D_INST_MT);
+  if (r) {
+    Model* im = (r->parent && r->index >= 0 && r->index < r->parent->instCount) ? r->parent->inst[r->index] : nullptr;
+    if (!im) luaL_error(L, "Model3D instance no longer exists");
+    return im;
+  }
   LuaModel3D* u = checkModel3D(L, idx);
   if (!u->model) luaL_error(L, "Model3D is unloaded");
   return u->model;
 }
 
+// Libera todas as instâncias de um Model3D (tem que acontecer antes de descarregar/recarregar o modelo-base,
+// porque elas apontam pros dados dele). Também tira da fila de desenho qualquer uma que ficou lá.
+static void model3dDestroyInstances(LuaModel3D* u) {
+  for (int i = 0; i < u->instCount; ++i) {
+    Model* m = u->inst[i];
+    if (!m) continue;
+    int k = 0;
+    for (int q = 0; q < gR3DQueueN; ++q) if (gR3DQueue[q] != m) gR3DQueue[k++] = gR3DQueue[q];
+    gR3DQueueN = k;
+    m->unload();
+    m->~Model();
+    heap_caps_free(m);
+    u->inst[i] = nullptr;
+  }
+  u->instCount = 0;
+}
+
+// Quem recebe a operação: uma instância => só ela; Model3D com instâncias => todas; Model3D sem instâncias => o próprio.
+static int model3dTargets(lua_State* L, int idx, Model** out) {
+  if (luaL_testudata(L, idx, LUA_MODEL3D_INST_MT)) { out[0] = checkModelPtr(L, idx); return 1; }
+  LuaModel3D* u = checkModel3D(L, idx);
+  if (!u->model) luaL_error(L, "Model3D is unloaded");
+  if (u->instCount > 0) {
+    int n = 0;
+    for (int i = 0; i < u->instCount; ++i) if (u->inst[i]) out[n++] = u->inst[i];
+    return n;
+  }
+  out[0] = u->model;
+  return 1;
+}
+
+// {x, y, z} -> Vec3 (campos ausentes ficam como estão em `v`)
+static void model3dReadVec3(lua_State* L, int idx, Vec3& v) {
+  luaL_checktype(L, idx, LUA_TTABLE);
+  float* c[3] = { &v.x, &v.y, &v.z };
+  for (int i = 0; i < 3; ++i) {
+    lua_rawgeti(L, idx, i + 1);
+    if (lua_isnumber(L, -1)) *c[i] = (float)lua_tonumber(L, -1);
+    lua_pop(L, 1);
+  }
+}
+
+static void model3dPushInstanceRef(lua_State* L, int parentIdx, int index) {
+  parentIdx = lua_absindex(L, parentIdx);
+  LuaModelInst* r = (LuaModelInst*)lua_newuserdatauv(L, sizeof(LuaModelInst), 1);
+  r->parent = (LuaModel3D*)lua_touserdata(L, parentIdx);
+  r->index = index;
+  lua_pushvalue(L, parentIdx);
+  lua_setiuservalue(L, -2, 1);          // a instância mantém o Model3D dono vivo
+  luaL_setmetatable(L, LUA_MODEL3D_INST_MT);
+}
+
 // Model3D(path)  or  Model3D() then :load(path)
 int l_model3d_new(lua_State* L) {
   LuaModel3D* u = (LuaModel3D*)lua_newuserdata(L, sizeof(LuaModel3D));
-  u->model = nullptr;
+  memset(u, 0, sizeof(LuaModel3D));      // model = nullptr, instCount = 0, inst[] = nullptr
   luaL_getmetatable(L, LUA_MODEL3D_MT);
   lua_setmetatable(L, -2);
 
@@ -5787,6 +5943,7 @@ int l_model3d_load(lua_State* L) {
     if (!mem) return luaL_error(L, "Model3D: out of memory");
     u->model = new (mem) Model();
   }
+  model3dDestroyInstances(u);            // instâncias apontam pros dados do modelo antigo
   Serial.printf("[R3D] loading %s ...\n", path);
   if (gPresentMutex) xSemaphoreTake(gPresentMutex, portMAX_DELAY);
   pinMode(10, OUTPUT);
@@ -5806,6 +5963,7 @@ int l_model3d_load(lua_State* L) {
 
 int l_model3d_unload(lua_State* L) {
   LuaModel3D* u = checkModel3D(L, 1);
+  model3dDestroyInstances(u);
   if (u->model) {
     u->model->unload();
   }
@@ -5814,6 +5972,7 @@ int l_model3d_unload(lua_State* L) {
 
 int l_model3d_gc(lua_State* L) {
   LuaModel3D* u = checkModel3D(L, 1);
+  model3dDestroyInstances(u);
   if (u->model) {
     u->model->unload();
     u->model->~Model();
@@ -5883,53 +6042,69 @@ int l_model3d_getScale(lua_State* L) {
 }
 
 // setCull("none"|"pos"|"neg") or integer 0/1/-1
+// Num Model3D com instâncias vale pra TODAS; numa instância (model.instances[i]) vale só pra ela.
 int l_model3d_setCull(lua_State* L) {
-  Model* m = checkModelPtr(L, 1);
+  Model* t[R3D_MAX_INSTANCES + 1];
+  const int n = model3dTargets(L, 1, t);
+  int cull;
   if (lua_isstring(L, 2)) {
     const char* s = lua_tostring(L, 2);
-    if (!r3d_stricmp(s, "none")) m->cull = CULL_NONE;
-    else if (!r3d_stricmp(s, "pos")) m->cull = CULL_POS_AREA;
-    else if (!r3d_stricmp(s, "neg")) m->cull = CULL_NEG_AREA;
+    if (!r3d_stricmp(s, "none")) cull = CULL_NONE;
+    else if (!r3d_stricmp(s, "pos")) cull = CULL_POS_AREA;
+    else if (!r3d_stricmp(s, "neg")) cull = CULL_NEG_AREA;
     else return luaL_error(L, "setCull: use none/pos/neg");
   } else {
-    m->cull = (int)luaL_checkinteger(L, 2);
+    cull = (int)luaL_checkinteger(L, 2);
   }
+  // o modelo-base também guarda o valor: instâncias criadas depois herdam
+  if (!luaL_testudata(L, 1, LUA_MODEL3D_INST_MT)) checkModelPtr(L, 1)->cull = cull;
+  for (int i = 0; i < n; ++i) t[i]->cull = cull;
   return 0;
 }
 
 int l_model3d_playAnim(lua_State* L) {
-  Model* m = checkModelPtr(L, 1);
+  Model* t[R3D_MAX_INSTANCES + 1];
+  const int n = model3dTargets(L, 1, t);
   bool loop   = lua_isnoneornil(L, 3) ? true : lua_toboolean(L, 3);
   float speed = (float)luaL_optnumber(L, 4, 1.0);
   float blend = (float)luaL_optnumber(L, 5, 0.15);
 
-  bool ok;
-  if (lua_type(L, 2) == LUA_TSTRING) {
-    ok = m->playAnim(lua_tostring(L, 2), loop, speed, blend);
-  } else {
-    ok = m->playAnim((int)luaL_checkinteger(L, 2), loop, speed, blend);
+  const bool byName = (lua_type(L, 2) == LUA_TSTRING);
+  const char* name = byName ? lua_tostring(L, 2) : nullptr;
+  const int clip = byName ? 0 : (int)luaL_checkinteger(L, 2);
+
+  bool ok = (n > 0);
+  for (int i = 0; i < n; ++i) {
+    const bool r = byName ? t[i]->playAnim(name, loop, speed, blend) : t[i]->playAnim(clip, loop, speed, blend);
+    ok = ok && r;
   }
   lua_pushboolean(L, ok);
   return 1;
 }
 
 int l_model3d_stopAnim(lua_State* L) {
-  Model* m = checkModelPtr(L, 1);
+  Model* t[R3D_MAX_INSTANCES + 1];
+  const int n = model3dTargets(L, 1, t);
   bool reset = lua_isnoneornil(L, 2) ? true : lua_toboolean(L, 2);
-  m->stopAnim(reset);
+  for (int i = 0; i < n; ++i) t[i]->stopAnim(reset);
   return 0;
 }
 
 int l_model3d_updateAnim(lua_State* L) {
-  Model* m = checkModelPtr(L, 1);
+  Model* t[R3D_MAX_INSTANCES + 1];
+  const int n = model3dTargets(L, 1, t);
   float dt = (float)luaL_checknumber(L, 2);
-  m->updateAnim(dt);
+  for (int i = 0; i < n; ++i) t[i]->updateAnim(dt);
   return 0;
 }
 
+// true se alguma (instância) estiver tocando
 int l_model3d_isPlaying(lua_State* L) {
-  Model* m = checkModelPtr(L, 1);
-  lua_pushboolean(L, m->animPlaying());
+  Model* t[R3D_MAX_INSTANCES + 1];
+  const int n = model3dTargets(L, 1, t);
+  bool any = false;
+  for (int i = 0; i < n; ++i) any = any || t[i]->animPlaying();
+  lua_pushboolean(L, any);
   return 1;
 }
 
@@ -5966,11 +6141,143 @@ int l_model3d_skinned(lua_State* L) {
 }
 
 // Queues model for the next Render3D()
+// Num Model3D com instâncias desenha todas as visíveis; numa instância desenha só ela (se visível).
 int l_model3d_draw(lua_State* L) {
-  Model* m = checkModelPtr(L, 1);
+  Model* t[R3D_MAX_INSTANCES + 1];
+  const int n = model3dTargets(L, 1, t);
   if (!gR3DReady) return luaL_error(L, "Init3DRenderer() first");
-  lua_pushboolean(L, r3dQueueModel(m));
+  // Model3D sem nenhuma instância não desenha nada (o modelo-base só guarda os dados compartilhados)
+  LuaModel3D* owner = (LuaModel3D*)luaL_testudata(L, 1, LUA_MODEL3D_MT);
+  if (owner && owner->instCount == 0) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  bool any = false;
+  for (int i = 0; i < n; ++i) {
+    if (t[i]->isVisible) any = r3dQueueModel(t[i]) || any;
+  }
+  lua_pushboolean(L, any);
   return 1;
+}
+
+// model:createInstance(position, scale) -> instance
+//   position = {x, y, z}  (padrão: posição do modelo-base)
+//   scale    = {sx, sy, sz} ou um número (escala uniforme)  (padrão: escala do modelo-base)
+// A instância herda o cull do modelo-base. Acesso: model.instances[0], model.instances[1], ... (#model.instances = quantidade)
+int l_model3d_createInstance(lua_State* L) {
+  LuaModel3D* u = checkModel3D(L, 1);
+  if (!u->model || !u->model->loaded()) return luaL_error(L, "createInstance: model not loaded");
+  if (u->instCount >= R3D_MAX_INSTANCES) return luaL_error(L, "createInstance: too many instances (max %d)", R3D_MAX_INSTANCES);
+
+  Vec3 pos = u->model->position;
+  Vec3 scl = u->model->scale;
+  if (!lua_isnoneornil(L, 2)) model3dReadVec3(L, 2, pos);
+  if (!lua_isnoneornil(L, 3)) {
+    if (lua_istable(L, 3)) model3dReadVec3(L, 3, scl);
+    else { const float s = (float)luaL_checknumber(L, 3); scl = {s, s, s}; }
+  }
+
+  void* mem = heap_caps_malloc(sizeof(Model), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!mem) return luaL_error(L, "createInstance: out of memory");
+  Model* m = new (mem) Model();
+  if (!m->cloneFrom(*u->model)) {
+    m->~Model();
+    heap_caps_free(mem);
+    return luaL_error(L, "createInstance: out of memory");
+  }
+  m->position = pos;
+  m->scale = scl;
+  m->promoteFrameData();
+
+  const int index = u->instCount;
+  u->inst[u->instCount++] = m;
+  model3dPushInstanceRef(L, 1, index);
+  return 1;
+}
+
+// model:clearInstances()  - remove todas as instâncias (o modelo-base continua carregado)
+int l_model3d_clearInstances(lua_State* L) {
+  LuaModel3D* u = checkModel3D(L, 1);
+  model3dDestroyInstances(u);
+  return 0;
+}
+
+// model:getInstanceCount()
+int l_model3d_getInstanceCount(lua_State* L) {
+  LuaModel3D* u = checkModel3D(L, 1);
+  lua_pushinteger(L, u->instCount);
+  return 1;
+}
+
+// ---- metamétodos ----
+// Model3D.__index: "instances" devolve a lista; o resto vem da tabela de métodos (upvalue 1)
+static int l_model3d_index(lua_State* L) {
+  LuaModel3D* u = checkModel3D(L, 1);
+  if (lua_type(L, 2) == LUA_TSTRING && strcmp(lua_tostring(L, 2), "instances") == 0) {
+    lua_getiuservalue(L, 1, 1);                 // lista em cache no próprio userdata
+    if (lua_type(L, -1) != LUA_TUSERDATA) {
+      lua_pop(L, 1);
+      LuaInstList* l = (LuaInstList*)lua_newuserdatauv(L, sizeof(LuaInstList), 1);
+      l->parent = u;
+      lua_pushvalue(L, 1);
+      lua_setiuservalue(L, -2, 1);              // mantém o Model3D vivo (o ciclo é coletado normalmente pelo GC)
+      luaL_setmetatable(L, LUA_MODEL3D_INSTLIST_MT);
+      lua_pushvalue(L, -1);
+      lua_setiuservalue(L, 1, 1);
+    }
+    return 1;
+  }
+  lua_pushvalue(L, 2);
+  lua_gettable(L, lua_upvalueindex(1));
+  return 1;
+}
+
+// instances[i] (0-based) -> instância | nil
+static int l_instlist_index(lua_State* L) {
+  LuaInstList* l = (LuaInstList*)luaL_checkudata(L, 1, LUA_MODEL3D_INSTLIST_MT);
+  if (lua_type(L, 2) == LUA_TNUMBER) {
+    int isnum = 0;
+    const lua_Integer i = lua_tointegerx(L, 2, &isnum);
+    if (isnum && i >= 0 && i < l->parent->instCount && l->parent->inst[i]) {
+      // o userdata dono é o uservalue da lista
+      lua_getiuservalue(L, 1, 1);
+      model3dPushInstanceRef(L, -1, (int)i);
+      return 1;
+    }
+  }
+  lua_pushnil(L);
+  return 1;
+}
+
+// #instances
+static int l_instlist_len(lua_State* L) {
+  LuaInstList* l = (LuaInstList*)luaL_checkudata(L, 1, LUA_MODEL3D_INSTLIST_MT);
+  lua_pushinteger(L, l->parent->instCount);
+  return 1;
+}
+
+// instance.isVisible / métodos
+static int l_inst_index(lua_State* L) {
+  Model* m = checkModelPtr(L, 1);
+  if (lua_type(L, 2) == LUA_TSTRING && strcmp(lua_tostring(L, 2), "isVisible") == 0) {
+    lua_pushboolean(L, m->isVisible);
+    return 1;
+  }
+  lua_pushvalue(L, 2);
+  lua_gettable(L, lua_upvalueindex(1));
+  return 1;
+}
+
+// instance.isVisible = true/false
+static int l_inst_newindex(lua_State* L) {
+  Model* m = checkModelPtr(L, 1);
+  const char* k = luaL_checkstring(L, 2);
+  if (strcmp(k, "isVisible") == 0) {
+    luaL_checkany(L, 3);
+    m->isVisible = lua_toboolean(L, 3) != 0;
+    return 0;
+  }
+  return luaL_error(L, "Model3D instance has no writable field '%s'", k);
 }
 
 void registerModel3D(lua_State* L) {
@@ -6008,8 +6315,32 @@ void registerModel3D(lua_State* L) {
   lua_pushcfunction(L, l_model3d_findAnim);    lua_setfield(L, -2, "findAnim");
   lua_pushcfunction(L, l_model3d_skinned);     lua_setfield(L, -2, "skinned");
   lua_pushcfunction(L, l_model3d_draw);        lua_setfield(L, -2, "draw");
+  lua_pushcfunction(L, l_model3d_createInstance);   lua_setfield(L, -2, "createInstance");
+  lua_pushcfunction(L, l_model3d_clearInstances);   lua_setfield(L, -2, "clearInstances");
+  lua_pushcfunction(L, l_model3d_getInstanceCount); lua_setfield(L, -2, "getInstanceCount");
+  // stack: [Model3D mt, methods]
+  lua_pushvalue(L, -1);                              // [mt, methods, methods]
+  lua_pushcclosure(L, l_model3d_index, 1);           // [mt, methods, index_fn]  (methods = upvalue)
+  lua_setfield(L, -3, "__index");                    // mt.__index = index_fn -> [mt, methods]
+
+  // metatable das instâncias: mesmos métodos + propriedade isVisible
+  luaL_newmetatable(L, LUA_MODEL3D_INST_MT);         // [mt, methods, imt]
+  lua_pushvalue(L, -2);                              // [mt, methods, imt, methods]
+  lua_pushcclosure(L, l_inst_index, 1);              // [mt, methods, imt, fn]
   lua_setfield(L, -2, "__index");
+  lua_pushcfunction(L, l_inst_newindex);
+  lua_setfield(L, -2, "__newindex");
+  lua_pop(L, 1);                                     // [mt, methods]
+
+  // metatable da lista model.instances
+  luaL_newmetatable(L, LUA_MODEL3D_INSTLIST_MT);
+  lua_pushcfunction(L, l_instlist_index);
+  lua_setfield(L, -2, "__index");
+  lua_pushcfunction(L, l_instlist_len);
+  lua_setfield(L, -2, "__len");
   lua_pop(L, 1);
+
+  lua_pop(L, 2);                                     // []
 
   Serial.println("[R3D] ctor table..."); Serial.flush();
   lua_newtable(L);
@@ -6332,7 +6663,7 @@ void taskLuaApp(void* arg) {
   registerApis(L);
   Serial.println("[LUA] registerApis ok"); Serial.flush();
 
-  const char* scriptPath = "/home/apps/3d_test/test_3d.lua"; // /sys/src/sys.lua and /home/apps/3d_test/test_3d.lua
+  const char* scriptPath = "/sys/src/sys.lua"; // /sys/src/sys.lua and /home/apps/3d_test/test_3d.lua
   Serial.printf("[LUA] opening %s\n", scriptPath); Serial.flush();
   File f = SD.open(scriptPath);
   if (!f) {
