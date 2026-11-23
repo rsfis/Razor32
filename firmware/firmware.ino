@@ -6726,11 +6726,11 @@ void registerApis(lua_State* L) {
   lua_register(L, LUA_OS_SET_USER_CONFIG_INTEGER_KEY, l_OS_SetUserConfigIntegerKey);
   lua_register(L, LUA_OS_SET_USER_CONFIG_STRING_KEY, l_OS_SetUserConfigStringKey);
   
-  #define STACKCHK(tag) do { Serial.printf("[LUA] %s top=%d\n", tag, lua_gettop(L)); Serial.flush(); } while(0)
+  //#define STACKCHK(tag) do { Serial.printf("[LUA] %s top=%d\n", tag, lua_gettop(L)); Serial.flush(); } while(0)
   
-  registerTime(L); STACKCHK("time");
-  registerSprite(L); STACKCHK("spr");
-  registerFont(L); STACKCHK("font");
+  registerTime(L); //STACKCHK("time");
+  registerSprite(L); //STACKCHK("spr");
+  registerFont(L); //STACKCHK("font");
   lua_register(L, LUA_OS_HAS_MOUSE_CONNECTED_DEFINITION, l_OS_HasMouseConnected);
   lua_register(L, LUA_OS_GET_MOUSE_POSITION_DEFINITION, l_OS_GetMousePosition);
   lua_register(L, LUA_OS_IS_MOUSE1_PRESSED_DEFINITION, l_OS_IsMouse1Pressed);
@@ -6755,9 +6755,8 @@ void registerApis(lua_State* L) {
   lua_register(L, LUA_OS_GET_WIFI_STATUS_DEFINITION, l_OS_GetWifiStatus);
   lua_register(L, LUA_OS_GET_CONNECTED_WIFI_SSID_DEFINITION, l_OS_GetConnectedWifiSSID);
   lua_register(L, LUA_OS_IS_WIFI_SCANNING_DEFINITION, l_OS_IsWifiScanning);
-  Serial.println("[LUA] registerR3D..."); Serial.flush();
   registerR3D(L);
-  Serial.println("[LUA] registerR3D ok"); Serial.flush();
+  Serial.println("[LUA] registered R3D"); Serial.flush();
 }
 
 // ===== DESCARGA COMPLETA DO PROGRAMA =====
@@ -6818,23 +6817,22 @@ static void programUnloadKernelState() {
 static bool runLuaProgram(const char* scriptPath) {
   luaHeapUsed = 0;
 
-  Serial.println("[LUA] lua_newstate..."); Serial.flush();
+  Serial.println("[LUA] Starting lua_newstate..."); Serial.flush();
   lua_State* L = lua_newstate(lua_psram_alloc, NULL, esp_random());
   if (!L) {
     Serial.println("ERR: Couldn't create LUA VM");
     Serial.flush();
     return false;
   }
-  Serial.println("[LUA] newstate ok"); Serial.flush();
+  Serial.println("[LUA] newstate Created"); Serial.flush();
 
   luaL_openlibs(L);
   lua_atpanic(L, r3d_lua_panic);
 
-  Serial.println("[LUA] registerApis..."); Serial.flush();
+  Serial.println("[LUA] registering apis..."); Serial.flush();
   registerApis(L);
-  Serial.println("[LUA] registerApis ok"); Serial.flush();
 
-  Serial.printf("[LUA] opening %s\n", scriptPath); Serial.flush();
+  Serial.printf("[LUA] opening program at %s\n", scriptPath); Serial.flush();
   File f = SD.open(scriptPath);
   if (!f) {
     Serial.printf("ERR: %s not found\n", scriptPath);
@@ -6857,7 +6855,7 @@ static bool runLuaProgram(const char* scriptPath) {
   f.readBytes(buffer, size);
   buffer[size] = '\0';
   f.close();
-  Serial.println("[LUA] script read ok, running..."); Serial.flush();
+  Serial.println("[LUA] No errors found on script. Running."); Serial.flush();
 
   luaTaskHandle = xTaskGetCurrentTaskHandle();
   luaTaskAlive = true;
