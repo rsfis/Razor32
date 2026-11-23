@@ -21,10 +21,10 @@
 #include <math.h>
 #include <new>
 
-// O Arduino compila em -Os (tamanho). Os laços de pixel (formas, fontes, cópia do quadro) querem velocidade.
+// Arduino compiles with -Os (size). Pixel loops (shapes, fonts, frame copy) want speed.
 #pragma GCC optimize ("O3")
 
-//Keys Pins (matriz 3 linhas x 10 colunas)
+//Key Pins (3 rows x 10 columns matrix)
 //Y1   8
 //Y2   21
 //Y3   41
@@ -46,7 +46,7 @@
 
 #define SD_CS 4
 
-// KEYBOARD MATRIX SIZE (#define, e não const int, pra já existir quando a IDE gerar os protótipos das funções)
+// KEYBOARD MATRIX SIZE (#define, not const int, so it already exists when the IDE generates function prototypes)
 #define KB_ROWS 3
 #define KB_COLS 10
 
@@ -104,32 +104,32 @@
 #define LUA_DISPLAY_DRAW_LINE_DEFINITION "Display_DrawLine"
 
 // ===== WIFI / BLUETOOTH TOGGLE =====
-// Nomes das teclas no kbLayout (tratadas só pelo kernel, o Lua nunca recebe elas)
+// Key names in kbLayout (handled only by the kernel, Lua never receives them)
 #define KEY_WIFI_TOGGLE "WifiToggle"
 #define KEY_BLUETOOTH_TOGGLE "BluetoothToggle"
-#define TOGGLE_KEY_COOLDOWN_MS 2000   // timer de utilização das duas teclas
-#define KERNEL_KEY_DEBUG 0            // 1 = imprime no Serial as teclas que o kernel vê (pra diagnóstico)
-#define TOAST_DURATION_MS 1500        // tempo da notificação rápida na tela
+#define TOGGLE_KEY_COOLDOWN_MS 2000   // usage timer for the two keys
+#define KERNEL_KEY_DEBUG 0            // 1 = print on Serial the keys the kernel sees (for diagnostics)
+#define TOAST_DURATION_MS 1500        // duration of the quick on-screen notification
 
 // ===== HOME =====
-// Tecla tratada pelo kernel (página 2 + CAPSLOCK, como o WifiToggle): derruba o programa atual e sobe o /sys/src/sys.lua.
+// Key handled by the kernel (page 2 + CAPSLOCK, like WifiToggle): kills the current program and loads /sys/src/sys.lua.
 #define KEY_HOME "HOME"
 #define HOME_PROGRAM_PATH "/sys/src/sys.lua"
-#define HOME_RELOAD_IF_ALREADY_HOME 0   // 1 = HOME recarrega o sys.lua mesmo se ele já for o programa rodando
-#define HOME_FORCE_RESTART_MS 3000      // último recurso: programa Lua preso (sem chamar nenhuma API) => esp_restart() (0 = desliga)
-#define KB_DEFAULT_DELAY_MS 300         // delay anti-flood padrão do teclado (OS_SetKeyboardDelay muda; a troca de programa restaura)
+#define HOME_RELOAD_IF_ALREADY_HOME 0   // 1 = HOME reloads sys.lua even if it is already the running program
+#define HOME_FORCE_RESTART_MS 3000      // last resort: stuck Lua program (not calling any API) => esp_restart() (0 = disable)
+#define KB_DEFAULT_DELAY_MS 300         // default keyboard anti-flood delay (OS_SetKeyboardDelay changes it; program switch restores)
 
-// ===== DISPLAY (mesmas técnicas de tela do 3d_models) =====
+// ===== DISPLAY (same display techniques as 3d_models) =====
 #ifndef SPI_WRITE_HZ
 #define SPI_WRITE_HZ 80000000
 #endif
 #ifndef ASYNC_PRESENT
-#define ASYNC_PRESENT 1     // 1 = tarefa de blit no núcleo 0 + 2 buffers de quadro (Lua desenha o quadro N+1 enquanto o N vai pelo SPI)
-#endif                      // 0 = 1 buffer; o próprio Display_UpdateScreen envia (ainda por DMA em RAM interna, dormindo durante o DMA)
+#define ASYNC_PRESENT 1     // 1 = blit task on core 0 + 2 frame buffers (Lua draws frame N+1 while N goes over SPI)
+#endif                      // 0 = 1 buffer; Display_UpdateScreen itself sends (still via DMA in internal RAM, sleeping during DMA)
 #ifndef BLIT_SLEEP
-#define BLIT_SLEEP 1        // 1 = dorme num timer de alta resolução enquanto o DMA corre (em vez de busy-wait)
+#define BLIT_SLEEP 1        // 1 = sleep on a high-resolution timer while DMA runs (instead of busy-wait)
 #endif
-#define DMA_CHUNK_PIXELS (480 * 16)   // pixels por bloco de DMA (2 buffers em RAM interna: ~30 KB)
+#define DMA_CHUNK_PIXELS (480 * 16)   // pixels per DMA block (2 buffers in internal RAM: ~30 KB)
 
 const char* ntpServer = "pool.ntp.org";
 long gmtOffset_sec = -3 * 3600;  // UTC-3
@@ -141,21 +141,21 @@ StaticJsonDocument<1024> UserConfiguration;
 
 struct Sprite;
 
-// Estilo das formas básicas (Display_DrawRect / Display_DrawElipse).
-// Definido aqui no topo pra já existir quando a IDE gerar os protótipos das funções.
+// Style of basic shapes (Display_DrawRect / Display_DrawElipse).
+// Defined here at the top so it already exists when the IDE generates function prototypes.
 struct ShapeStyle {
   bool hasFill = false;
   bool hasBorder = false;
   uint16_t fill = 0;
   uint16_t border = 0;
-  int bw = 0;            // espessura da borda (px)
+  int bw = 0;            // border thickness (px)
 };
 
 #define SHAPE_DEG2RAD 0.017453292f
-#define SHAPE_POLY_MAX 64          // máximo de vértices em Display_DrawPoligon
-#define SHAPE_JOIN_MITER 0         // quina pontuda (vira bevel se o ângulo for muito fechado)
-#define SHAPE_JOIN_BEVEL 1         // quina cortada
-#define SHAPE_JOIN_ROUND 2         // quina arredondada
+#define SHAPE_POLY_MAX 64          // maximum vertices in Display_DrawPoligon
+#define SHAPE_JOIN_MITER 0         // pointed corner (becomes bevel if angle is too tight)
+#define SHAPE_JOIN_BEVEL 1         // cut corner
+#define SHAPE_JOIN_ROUND 2         // rounded corner
 
 
 // ===== R3D types early (Arduino auto-prototypes all functions before later structs) =====
@@ -168,12 +168,12 @@ struct LuaModel3D;      // Lua userdata wrapper
 
 
 // ===== KERNEL SERVICES (forward declarations) =====
-void kernelLuaCheckpoint();                 // ponto onde a task Lua pode ser pausada pelo kernel
+void kernelLuaCheckpoint();                 // point where the Lua task can be paused by the kernel
 void kernelShowToast(const char* msg);
 bool kernelAskConnectBluetooth(const char* name, const char* addr);
 volatile bool toastActive = false;
-static void r3dReleaseBuf(int idx);                                   // devolve um buffer de cor 3D ao pool (definida na seção R3D)
-static const uint16_t* r3dLayerPtr(int idx, int* w, int* h);          // pixels + tamanho de um buffer de cor 3D
+static void r3dReleaseBuf(int idx);                                   // returns a 3D color buffer to the pool (defined in R3D section)
+static const uint16_t* r3dLayerPtr(int idx, int* w, int* h);          // pixels + size of a 3D color buffer
 
 // ===== Lua headers =====
 extern "C" {
@@ -207,7 +207,7 @@ public:
       _panel_instance.setBus(&_bus_instance);
     }
 
-    { // Painel ST7796
+    { // ST7796 Panel
       auto cfg = _panel_instance.config();
       cfg.pin_cs  = 10;
       cfg.pin_rst = 11;
@@ -222,8 +222,8 @@ public:
       cfg.offset_y = 0;
 
       cfg.readable   = false;
-      cfg.invert     = true;    // ⚠️ deixar true
-      cfg.rgb_order  = false;   // ⚠️ força modo BGR (a maioria dessas telas usa)
+      cfg.invert     = true;    // ⚠️ leave true
+      cfg.rgb_order  = false;   // ⚠️ force BGR mode (most of these screens use it)
       cfg.dlen_16bit = false;
       cfg.bus_shared = true;
 
@@ -246,8 +246,8 @@ public:
 
 LGFX tft;
 
-// Dois buffers de quadro (PSRAM): o Lua desenha em um enquanto o outro vai pelo SPI (ver DISPLAY ENGINE).
-// 'frame' continua sendo o nome usado no código todo: aponta sempre pro buffer em que o Lua está desenhando agora.
+// Two frame buffers (PSRAM): Lua draws on one while the other goes over SPI (see DISPLAY ENGINE).
+// 'frame' remains the name used throughout the code: always points to the buffer Lua is currently drawing on.
 static LGFX_Sprite frameBuf0(&tft);
 static LGFX_Sprite frameBuf1(&tft);
 static LGFX_Sprite* const frameBufs[2] = { &frameBuf0, &frameBuf1 };
@@ -256,14 +256,14 @@ static int gDrawIdx = 0;
 #define frame (*gDrawFrame)
 
 // ===== DIRTY RECT TRACKING =====
-// Em vez de limpar/enviar a tela inteira a cada ciclo Display_ClearScreen()/Display_UpdateScreen(), rastreamos
-// as regioes que efetivamente foram desenhadas (Sprite:draw(), Font:drawString(), formas) entre um clear e o
-// update seguinte, e so tocamos essas regioes na PSRAM e no SPI.
-// ANTES: um unico retangulo (uniao de tudo). Dois elementos longe um do outro (ex.: barra de status + icone no
-// canto oposto) faziam a UNIAO cobrir quase a tela inteira. AGORA: uma pequena lista de ate DIRTY_MAX retangulos;
-// dois retangulos so sao fundidos quando o retangulo da uniao custa quase o mesmo que os dois separados.
+// Instead of clearing/sending the entire screen every Display_ClearScreen()/Display_UpdateScreen() cycle, we track
+// the regions that were actually drawn (Sprite:draw(), Font:drawString(), shapes) between a clear and the
+// following update, and only touch those regions in PSRAM and on SPI.
+// BEFORE: a single rectangle (union of everything). Two elements far from each other (e.g. status bar + icon in
+// opposite corner) made the UNION cover almost the entire screen. NOW: a small list of up to DIRTY_MAX rectangles;
+// two rectangles are only merged when the union rectangle costs almost the same as the two separate ones.
 #define DIRTY_MAX 6
-#define DIRTY_MERGE_SLACK 512   // pixels "de graca" tolerados ao fundir (~ custo fixo de mais uma janela + DMA)
+#define DIRTY_MERGE_SLACK 512   // "free" pixels tolerated when merging (~ fixed cost of one more window + DMA)
 
 struct IRect { int16_t x, y, w, h; };
 struct DirtyList {
@@ -271,8 +271,8 @@ struct DirtyList {
   int n = 0;
 };
 
-DirtyList frameDirtyAccum;  // o que foi desenhado NESTE frame (entre clear e update)
-DirtyList frameDirtyPrev;   // o que foi desenhado (e portanto ficou visivel) no frame anterior
+DirtyList frameDirtyAccum;  // what was drawn in THIS frame (between clear and update)
+DirtyList frameDirtyPrev;   // what was drawn (and therefore remained visible) in the previous frame
 bool frameEverPushed = false;
 
 void clampRectToScreen(int &x, int &y, int &w, int &h) {
@@ -294,9 +294,9 @@ static inline IRect irUnion(const IRect& a, const IRect& b) {
   return r;
 }
 
-// Adiciona um retangulo (ja recortado na tela) a lista, fundindo com os existentes quando compensa.
+// Add a rectangle to the list, funding with the existents when its worth
 static void dlAdd(DirtyList& d, IRect nr) {
-  for (;;) {                                   // funde em cascata: o retangulo cresce e pode alcancar outros
+  for (;;) {                                   // cascade merge: the rectangle grows and may reach others
     int hit = -1;
     IRect u = nr;
     for (int i = 0; i < d.n; i++) {
@@ -305,11 +305,11 @@ static void dlAdd(DirtyList& d, IRect nr) {
     }
     if (hit < 0) break;
     nr = u;
-    d.r[hit] = d.r[--d.n];                     // remove o absorvido
+    d.r[hit] = d.r[--d.n];                     // remove the absorbed one
   }
   if (d.n < DIRTY_MAX) { d.r[d.n++] = nr; return; }
 
-  // Lista cheia: funde o par (contando o novo) que menos pixels extras gera
+  // List full: merge the pair (including the new one) that generates the fewest extra pixels
   IRect t[DIRTY_MAX + 1];
   for (int i = 0; i < d.n; i++) t[i] = d.r[i];
   t[d.n] = nr;
@@ -329,18 +329,18 @@ static void dlAdd(DirtyList& d, IRect nr) {
 
 void markDirty(int x, int y, int w, int h) {
   if (w <= 0 || h <= 0) return;
-  clampRectToScreen(x, y, w, h);               // a lista so guarda retangulos dentro da tela
+  clampRectToScreen(x, y, w, h);               // the list only stores rectangles inside the screen
   if (w <= 0 || h <= 0) return;
   IRect r;
   r.x = (int16_t)x; r.y = (int16_t)y; r.w = (int16_t)w; r.h = (int16_t)h;
   dlAdd(frameDirtyAccum, r);
 }
 
-// ---- COMANDOS DE DESENHO: hash + retangulo de cada um, comparados quadro a quadro ----
-// Cada Sprite:draw / Font:drawString / Display_Draw* registra {hash dos argumentos, retangulo}. O quadro e uma funcao
-// deterministica da lista de comandos; se o comando i e igual ao do quadro anterior, so os pixels dentro do retangulo
-// dos comandos que MUDARAM (antigo + novo) podem ter mudado. Entao o que vai pro SPI e so isso (um wallpaper
-// redesenhado todo quadro nao custa mais nada no barramento). Qualquer duvida => cai na regra antiga (anterior + atual).
+// ---- DRAW COMMANDS: hash + rectangle of each, compared frame by frame ----
+// Each Sprite:draw / Font:drawString / Display_Draw* records {hash of arguments, rectangle}. The frame is a deterministic
+// function of the command list; if command i is equal to the previous frame's, only the pixels inside the rectangle
+// of the commands that CHANGED (old + new) may have changed. So what goes to SPI is only that (a wallpaper
+// redrawn every frame costs nothing extra on the bus). Any doubt => falls back to the old rule (previous + current).
 static inline uint32_t hmix(uint32_t h, uint32_t v) {
   h ^= v; h *= 0x85EBCA6Bu; h ^= h >> 15; h *= 0xC2B2AE35u; h ^= h >> 13;
   return h;
@@ -372,9 +372,9 @@ static void cmdRecord(uint32_t hash, int x, int y, int w, int h) {
   if (r.w > 0) dlAdd(frameDirtyAccum, r);
 }
 
-// ---- LIMPEZA PREGUICOSA ----
-// Display_ClearScreen so anota o que precisa voltar pra preto. O memset acontece no 1o desenho que nao cobre tudo
-// (ou no Display_UpdateScreen). Um sprite opaco que cobre a regiao (wallpaper) torna o memset inutil.
+// ---- LAZY CLEAR ----
+// Display_ClearScreen only notes what needs to go back to black. The memset happens on the 1st draw that does not cover everything
+// (or on Display_UpdateScreen). An opaque sprite that covers the region (wallpaper) makes the memset useless.
 static DirtyList gPendClear;
 
 static void clearRectBlack(const IRect& r) {
@@ -394,7 +394,7 @@ static void flushClear() {
   gPendClear.n = 0;
 }
 
-// Chamar antes de um desenho OPACO em [x,x+w) x [y,y+h): se cobre todas as regioes pendentes, descarta a limpeza
+// Call before an OPAQUE draw at [x,x+w) x [y,y+h): if it covers all pending regions, discard the clear
 static void flushClearUnless(int x, int y, int w, int h) {
   if (gPendClear.n == 0) return;
   clampRectToScreen(x, y, w, h);
@@ -409,36 +409,36 @@ static void flushClearUnless(int x, int y, int w, int h) {
 static uint32_t gSpriteSerial = 0;
 
 // ===== DISPLAY ENGINE =====
-// Mesmas ideias do blit do 3d_models:
-//  - o retângulo sujo do quadro (PSRAM) vai pro painel em BLOCOS de linhas copiados pra 2 buffers de DMA em RAM INTERNA
-//    (alternados: enquanto um bloco corre pelo SPI, o próximo já está sendo copiado);
-//  - enquanto o DMA corre, a tarefa DORME num timer de alta resolução em vez de girar em busy-wait e só gira o restinho
-//    (a margem de despertar se auto-ajusta): sobra CPU pro Wi-Fi / BLE / kernel;
-//  - ASYNC_PRESENT: 2 buffers de quadro + tarefa de blit no núcleo 0 (filas free/full);
-//  - o toast é composto direto nos blocos de DMA (como o overlay de FPS do 3d_models): sem transação SPI extra nem flicker.
+// Same ideas as the 3d_models blit:
+//  - the dirty rectangle of the frame (PSRAM) goes to the panel in BLOCKS of lines copied to 2 DMA buffers in INTERNAL RAM
+//    (alternating: while one block runs over SPI, the next is already being copied);
+//  - while DMA runs, the task SLEEPS on a high-resolution timer instead of spinning in busy-wait and only spins the remainder
+//    (the wake margin self-adjusts): CPU left for Wi-Fi / BLE / kernel;
+//  - ASYNC_PRESENT: 2 frame buffers + blit task on core 0 (free/full queues);
+//  - the toast is composited directly into the DMA blocks (like the FPS overlay of 3d_models): no extra SPI transaction or flicker.
 static const int TOAST_X = 140, TOAST_Y = 6, TOAST_W = 200, TOAST_H = 26;
 
 struct PresentJob { int16_t idx, n, layer; IRect r[DIRTY_MAX]; };
 
-static DirtyList bufDirty[2];              // por buffer de quadro: região desenhada NELE (fora dela ele é preto)
+static DirtyList bufDirty[2];              // per frame buffer: region drawn ON IT (outside it is black)
 static bool gAsync = false;
 static uint16_t* gDmaBuf[2] = { nullptr, nullptr };
 static QueueHandle_t gFreeQ = nullptr, gFullQ = nullptr;
-static SemaphoreHandle_t gPresentMutex = nullptr;   // serializa TODO acesso de escrita ao painel + os buffers de DMA
+static SemaphoreHandle_t gPresentMutex = nullptr;   // serializes ALL write access to the panel + the DMA buffers
 static std::atomic<int> gJobsPending(0);
-// CAMADA 3D: Composite3DToFrame() não copia mais o 3D pro buffer 2D. Ele só "reivindica" o buffer de cor 3D como FUNDO do
-// quadro (gLayerSrcIdx); o motor de tela amplia 2x direto nos blocos de DMA e põe o HUD (pixels não-pretos do buffer 2D,
-// só dentro dos retângulos sujos) por cima. Sem a escrita de 307 KB na PSRAM + a releitura deles.
-static int gLayerSrcIdx = -1;      // camada pendente do quadro em desenho (-1 = nenhuma)
-static int gLayerPrevShown = 0;    // o último quadro enviado teve camada (o painel mostra 3D fora do HUD)
-static int gLastLayerIdx = -1;     // camada do último quadro enviado (o kernel repinta o toast com ela)
-static std::atomic<int> gR3DPending(0);            // quadros 3D enfileirados / ainda indo pelo SPI (tarefa de blit 3D)
-static volatile int gLastShownIdx = -1;             // buffer do último quadro enviado (usado pra repintar toast/dialog)
+// 3D LAYER: Composite3DToFrame() no longer copies the 3D to the 2D buffer. It only "claims" the 3D color buffer as the BACKGROUND of
+// the frame (gLayerSrcIdx); the display engine upscales 2x directly in the DMA blocks and puts the HUD (non-black pixels of the 2D buffer,
+// only inside the dirty rectangles) on top. Without the 307 KB write to PSRAM + re-reading them.
+static int gLayerSrcIdx = -1;      // pending layer of the frame being drawn (-1 = none)
+static int gLayerPrevShown = 0;    // the last sent frame had a layer (the panel shows 3D outside the HUD)
+static int gLastLayerIdx = -1;     // layer of the last sent frame (the kernel repaints the toast with it)
+static std::atomic<int> gR3DPending(0);            // 3D frames queued / still going over SPI (3D blit task)
+static volatile int gLastShownIdx = -1;             // buffer of the last sent frame (used to repaint toast/dialog)
 static esp_timer_handle_t gBlitTimer = nullptr;
 static volatile TaskHandle_t gBlitWaiter = nullptr;
 static int gBlitMarginUs = 250;
-static LGFX_Sprite toastSpr(&tft);                  // toast pré-renderizado (RAM interna), composto nos blocos de DMA
-static uint16_t toastKey = 0;                       // valor bruto da cor transparente do toast
+static LGFX_Sprite toastSpr(&tft);                  // toast pré-renderizado (internal RAM), composto nos blocos de DMA
+static uint16_t toastKey = 0;                       // raw value of the toast transparent color
 static bool gToastOk = false;
 
 static void blitTimerCb(void*) {
@@ -688,18 +688,18 @@ static void displayEngineBegin() {
 
   gPresentMutex = xSemaphoreCreateMutex();
 
-  // toast pré-renderizado: 200x26 em RAM interna
+  // toast pré-renderizado: 200x26 em internal RAM
   toastSpr.setPsram(false);
   toastSpr.setColorDepth(16);
   gToastOk = (toastSpr.createSprite(TOAST_W, TOAST_H) != nullptr);
-  if (!gToastOk) Serial.println("WARN: sem RAM interna pro toast (notificacoes desativadas)");
+  if (!gToastOk) Serial.println("WARN: no internal RAM for toast (notifications disabled)");
 
   gAsync = false;
 #if ASYNC_PRESENT
   frameBuf1.setPsram(true);
   frameBuf1.setColorDepth(16);
   if (frameBuf1.createSprite(W, H)) gAsync = true;
-  else Serial.println("WARN: sem PSRAM pro 2o buffer de quadro; apresentando em modo sincrono");
+  else Serial.println("WARN: no PSRAM for 2nd frame buffer; presenting in sync mode");
 #endif
 
   frameBuf0.fillScreen(TFT_BLACK);
@@ -730,7 +730,7 @@ static void displayEngineBegin() {
     xTaskCreatePinnedToCore(blitTask, "BLIT", 5120, NULL, 2, NULL, 0);
   }
 
-  Serial.printf("Display engine: %s | DMA %d px x2 (RAM interna) | SPI %d MHz | blit sleep %d\n",
+  Serial.printf("Display engine: %s | DMA %d px x2 (internal RAM) | SPI %d MHz | blit sleep %d\n",
                 gAsync ? "async, 2 frame buffers" : "sync, 1 frame buffer",
                 DMA_CHUNK_PIXELS, SPI_WRITE_HZ / 1000000, (int)BLIT_SLEEP);
 }
@@ -1144,7 +1144,7 @@ typedef struct {
 #define LUA_PROGRAM_PATH_MAX 160
 static char gNextProgramPath[LUA_PROGRAM_PATH_MAX];
 static volatile bool gNextProgramReq = false;
-static volatile bool gCurrentIsHome = false;     // o sys.lua está rodando (script ainda não terminou)
+static volatile bool gCurrentIsHome = false;     // sys.lua is running (script has not finished yet)
 static portMUX_TYPE gProgMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Enquanto houver troca pendente, TODA instrução Lua levanta erro: assim nem um pcall() do programa
@@ -1841,7 +1841,7 @@ static void shapeStrokeJoin(float ax, float ay, float vx, float vy, float bx, fl
 
   const float cross = d1x * d2y - d1y * d2x;
   const float dot = d1x * d2x + d1y * d2y;
-  if (fabsf(cross) < 1e-3f) return;   // reto: não tem fresta pra preencher
+  if (fabsf(cross) < 1e-3f) return;   // straight: no gap to fill
 
   if (join == SHAPE_JOIN_ROUND) {
     shapeFillDisc(vx, vy, h, color);
@@ -3500,7 +3500,7 @@ static void kernelTask(void* arg) {
       } else if (!luaTaskAlive || luaPauseReq) {
         gHomeWatchMs = millis() | 1;                    // VM ociosa ou pausada pelo kernel: ainda não é travamento
       } else if ((uint32_t)(millis() - gHomeWatchMs) >= HOME_FORCE_RESTART_MS) {
-        Serial.println("[Kernel] HOME: programa nao respondeu, reiniciando");
+        Serial.println("[Kernel] HOME: program didn't answer. Restarting kernel.");
         Serial.flush();
         esp_restart();
       }
@@ -4008,8 +4008,8 @@ void registerFont(lua_State* L){
 // ============================ CONFIG ============================
 #define RENDER_DIV    2     // resolução interna = tela / RENDER_DIV (o blit assume 2 => 240x160)
 #define CHUNK_HR      8     // linhas internas por bloco de DMA
-#define INTERNAL_RESERVE (40 * 1024) // RAM interna que nunca é consumida pelos buffers
-#define FORCE_PSRAM   0     // 0 = buffers "quentes" (z, cores) tentam RAM interna e caem pra PSRAM sozinhos
+#define INTERNAL_RESERVE (40 * 1024) // internal RAM que nunca é consumida pelos buffers
+#define FORCE_PSRAM   0     // 0 = buffers "quentes" (z, cores) tentam internal RAM e caem pra PSRAM sozinhos
                             // 1 = tudo na PSRAM (comportamento antigo, bem mais lento)
 #define SPAN_N        16    // a cada N pixels a textura é corrigida em perspectiva (menor = mais exato, mais lento)
 #define SPAN_FAR      32    // trecho maior, usado quando 1/w varia pouco no trecho (superfícies distantes/frontais)
@@ -4056,10 +4056,10 @@ static_assert(SPAN_N >= 1 && SPAN_N <= SPAN_FAR, "SPAN_N deve estar entre 1 e SP
 #define R3D_FPS_OVERLAY 0   // 1 = desenha "FPS:xx.x" no canto do quadro 3D (na tarefa de blit)
 #endif
 #ifndef COLORB_INTERNAL
-#define COLORB_INTERNAL 1   // 1 = 2º buffer de cor na RAM interna (padrão). 0 = PSRAM: libera ~75 KB internos para promoteTextures()
+#define COLORB_INTERNAL 1   // 1 = 2º buffer de cor na internal RAM (padrão). 0 = PSRAM: libera ~75 KB internos para promoteTextures()
 #endif                      // (escrita de cor é sequencial = cache da PSRAM perdoa; textura é acesso aleatório = não perdoa). Teste os dois!
 #ifndef PROMOTE_RESERVE
-#define PROMOTE_RESERVE (56 * 1024)   // RAM interna que SEMPRE sobra depois de promover texturas/arrays por quadro
+#define PROMOTE_RESERVE (56 * 1024)   // internal RAM que SEMPRE sobra depois de promover texturas/arrays por quadro
 #endif
 static_assert(ML_MAXV >= 3 && ML_MAXV <= 255, "ML_MAXV: índices locais são uint8_t");
 static_assert(ML_MAXT >= 1 && ML_MAXT <= 255, "ML_MAXT deve caber em uint8_t");
@@ -4120,7 +4120,7 @@ struct Target {
   int y0, y1;          // faixa de linhas [y0,y1) que ESTE chamador pode escrever
   uint16_t *color;     // RGB565, bytes já trocados (formato do painel)
   uint16_t *depth;     // 16 bits de 1/w escalado; 0 = infinito
-  SV *sv;              // vértices projetados do meshlet atual (ML_MAXV entradas, RAM interna)
+  SV *sv;              // vértices projetados do meshlet atual (ML_MAXV entradas, internal RAM)
   uint8_t *oc;         // outcode de frustum de cada vértice (bit0 L, 1 R, 2 B, 3 T, 4 near)
   float nearW;
   float depthScale;    // 60000 * near  (1/w máx = 1/near)
@@ -4211,11 +4211,11 @@ static void errf(const char* fmt, ...) {
   }
 }
 
-// Alocador. hot=true  -> buffers acessados pixel a pixel (z, cor): tenta RAM interna primeiro.
-//           hot=false -> dados do SD (vértices, texturas): sempre PSRAM, pra não gastar a RAM interna.
+// Alocador. hot=true  -> buffers acessados pixel a pixel (z, cor): tenta internal RAM primeiro.
+//           hot=false -> dados do SD (vértices, texturas): sempre PSRAM, pra não gastar a internal RAM.
 static void* allocFast(size_t bytes, const char* name, bool hot) {
   void* p = nullptr;
-  const char* where = "RAM interna";
+  const char* where = "internal RAM";
 #if !FORCE_PSRAM
   if (hot && heap_caps_get_free_size(MALLOC_CAP_INTERNAL) > bytes + INTERNAL_RESERVE)
     p = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -4689,7 +4689,7 @@ static void mbRun(MeshletBuild& b, const RzMesh* rm, uint32_t meshCount) {
   }
 }
 
-// tenta mover um bloco da PSRAM p/ RAM interna (só se sobrar PROMOTE_RESERVE depois). Devolve o ponteiro novo (ou o antigo).
+// tenta mover um bloco da PSRAM p/ internal RAM (só se sobrar PROMOTE_RESERVE depois). Devolve o ponteiro novo (ou o antigo).
 static void* moveInternal(void* p, size_t bytes) {
   if (!p || !bytes) return p;
   if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) <= bytes + PROMOTE_RESERVE) return p;
@@ -4819,7 +4819,7 @@ struct Model {
   }
 
   // Vira uma instância do modelo `s` (que precisa estar carregado e não ser ele mesmo uma instância).
-  // Só aloca o estado por instância. Chame promoteFrameData() depois pra mover os arrays pequenos pra RAM interna.
+  // Só aloca o estado por instância. Chame promoteFrameData() depois pra mover os arrays pequenos pra internal RAM.
   bool cloneFrom(const Model& s) {
     if (!s.loaded() || s.isClone) return false;
     isClone = true;
@@ -4968,7 +4968,7 @@ struct Model {
 
     sPos.release(); sUv.release(); sIdx.release(); sMesh.release(); sMap.release(); sSk.release();
 
-    // ordem de desenho / lista de visíveis (RAM interna se sobrar; senão PSRAM)
+    // ordem de desenho / lista de visíveis (internal RAM se sobrar; senão PSRAM)
     order = (uint16_t*)allocFast(sizeof(uint16_t) * (size_t)mlCount, "ordem", false);
     skey  = (float*)   allocFast(sizeof(float)    * (size_t)mlCount, "chaves z", false);
     vis   = (uint16_t*)allocFast(sizeof(uint16_t) * (size_t)mlCount, "visiveis", false);
@@ -5260,7 +5260,7 @@ struct Model {
   // e publica a lista `vis`. Os 2 núcleos só LEEM `vis`; cada faixa ainda faz seu teste de linhas.
   // Frente->trás = early-z: o que vem atrás falha no z-test sem amostrar textura.
   // Os cabeçalhos (PSRAM) são lidos UMA vez, em sequência; o sort e a montagem de `vis` só mexem em arrays pequenos
-  // (RAM interna, veja promoteFrameData). Insertion sort sobre a ordem do quadro anterior (~O(n)); com orçamento
+  // (internal RAM, veja promoteFrameData). Insertion sort sobre a ordem do quadro anterior (~O(n)); com orçamento
   // de deslocamentos: se estourar (câmera "teleportou"), cai num std::sort.
   void prepare(const Mat4 &MVP, float nearW) {
     visCount = 0;
@@ -5325,7 +5325,7 @@ struct Model {
     visCount = n;
   }
 
-  // Depois que os buffers grandes (z, cores, DMA) e as tarefas já existem: move pra RAM interna os arrays que o
+  // Depois que os buffers grandes (z, cores, DMA) e as tarefas já existem: move pra internal RAM os arrays que o
   // mestre e as faixas tocam o tempo todo (pequenos), se sobrar espaço. Chame 1x por modelo, no setup().
   void promoteFrameData() {
     if (mlCount <= 0) return;
@@ -5337,17 +5337,17 @@ struct Model {
       order = (uint16_t*)moveInternal(order, 2 * n);
       skey  = (float*)   moveInternal(skey,  4 * n);
     }
-    Serial.printf("  arrays por quadro (%u meshlets): %s\n", (unsigned)n, (vis != v0) ? "RAM interna" : "PSRAM (sem espaco)");
+    Serial.printf("  per-frame arrays (%u meshlets): %s\n", (unsigned)n, (vis != v0) ? "internal RAM" : "PSRAM (no space)");
     if (vskin && poolV > 0) {                       // vértices skinned: lidos por todas as faixas a cada quadro
       Vtx* v1 = vskin;
       vskin = (Vtx*)moveInternal(vskin, sizeof(Vtx) * (size_t)poolV);
       vdraw = vskin;
-      Serial.printf("  vertices skin (%d): %s\n", poolV, (vskin != v1) ? "RAM interna" : "PSRAM");
+      Serial.printf("  skin vertices (%d): %s\n", poolV, (vskin != v1) ? "internal RAM" : "PSRAM");
     }
   }
 
-  // Move texturas pra RAM interna, das mais "densas" (triângulos que a usam / bytes) pras menos, enquanto
-  // sobrar PROMOTE_RESERVE. A cache de dados da PSRAM é pequena; textura em RAM interna não sofre miss.
+  // Move texturas pra internal RAM, das mais "densas" (triângulos que a usam / bytes) pras menos, enquanto
+  // sobrar PROMOTE_RESERVE. A cache de dados da PSRAM é pequena; textura em internal RAM não sofre miss.
   void promoteTextures() {
     if (!texs || texCount <= 0 || mlCount <= 0) return;
     uint32_t* use = (uint32_t*)heap_caps_malloc(sizeof(uint32_t) * (size_t)texCount, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -5369,7 +5369,7 @@ struct Model {
       if (q != texs[best].data) { texs[best].data = q; ++moved; movedBytes += bytes; }
     }
     heap_caps_free(use);
-    Serial.printf("  texturas em RAM interna: %d de %d (%u B)\n", moved, texCount, (unsigned)movedBytes);
+    Serial.printf("  texturas em internal RAM: %d de %d (%u B)\n", moved, texCount, (unsigned)movedBytes);
   }
 
   // definido DEPOIS da classe: função-membro definida dentro da classe é implicitamente inline (seção COMDAT) e, na IRAM,
@@ -5414,7 +5414,7 @@ void HOT Model::draw(const Mat4 &MVP, const Target &T) const
       const uint8_t* tp = tpool + 3 * (size_t)s.tOff;
       const int nv = s.nv, nt = s.nt;
 
-      // ---- projeta os vértices do meshlet (≤ ML_MAXV, resultados em RAM interna) ----
+      // ---- projeta os vértices do meshlet (≤ ML_MAXV, resultados em internal RAM) ----
       for (int j = 0; j < nv; ++j) {
         const Vtx &p = vb[j];
         const float x = p.x, y = p.y, z = p.z;
@@ -5575,7 +5575,7 @@ int HR_W, HR_H;
 static uint16_t *colorBuf[2] = {nullptr, nullptr};
 static uint16_t *zBuf = nullptr;
 static uint16_t *dmaBuf[2] = {nullptr, nullptr};
-// scratch de projeção de UM meshlet por contexto de raster (0 = núcleo do loop, 1 = worker): RAM interna estática
+// scratch de projeção de UM meshlet por contexto de raster (0 = núcleo do loop, 1 = worker): internal RAM estática
 static SV      gSV[2][ML_MAXV];
 static uint8_t gOC[2][ML_MAXV];
 
@@ -5823,8 +5823,8 @@ static bool r3dInit(int renderDiv, bool dualCore) {
   const size_t total = (size_t)HR_W * HR_H;
   const size_t dmaBytes = (size_t)CHUNK_HR * 2 * SCR_W * 2;
   // DMA scratch must be internal; frame color/z can be PSRAM
-  // Os blocos de DMA do motor de tela 2D (mesmo tamanho, RAM interna) servem aqui também: o acesso ao painel já é
-  // serializado por gPresentMutex, então não precisa de mais 30 KB de RAM interna.
+  // Os blocos de DMA do motor de tela 2D (mesmo tamanho, internal RAM) servem aqui também: o acesso ao painel já é
+  // serializado por gPresentMutex, então não precisa de mais 30 KB de internal RAM.
   if (gDmaBuf[0] && gDmaBuf[1] && dmaBytes <= (size_t)DMA_CHUNK_PIXELS * 2) {
     dmaBuf[0] = gDmaBuf[0];
     dmaBuf[1] = gDmaBuf[1];
@@ -6896,7 +6896,7 @@ static bool runLuaProgram(const char* scriptPath) {
   Serial.printf("[LUA] VM Shutdown: lua heap residual=%u, psram %u -> %u, heap %u -> %u\n",
                 (unsigned)luaHeapUsed, (unsigned)psramBefore, (unsigned)ESP.getFreePsram(),
                 (unsigned)heapBefore, (unsigned)ESP.getFreeHeap());
-  if (luaHeapUsed != 0) Serial.println("[LUA] WARN: memoria da VM nao voltou a zero apos lua_close");
+  if (luaHeapUsed != 0) Serial.println("[LUA] WARN: VM memory did not return to zero after lua_close");
   return switching;
 }
 
@@ -6993,7 +6993,7 @@ void setup() {
     tft.setTextColor(TFT_WHITE);
     tft.setTextSize(1.5);
     tft.setCursor(5, 5);
-    tft.print("ERR 0x003 - Couldn't open bios settings bios.json.");
+    tft.print("ERR 0x003 - Couldn't open bios settings boot.json.");
   }
   DeserializationError error = deserializeJson(BiosConfiguration, biosConfigFile);
 
@@ -7021,7 +7021,7 @@ void setup() {
 
   // Colors Test
   if (BiosConfiguration["TestScreenColorsWhenStartingUp"] == true){
-    Serial.printf("Testing screen colours\n");
+    Serial.printf("Testing screen colors\n");
     tft.fillScreen(tft.color565(255, 0, 255));
     delay(1000);
     tft.fillScreen(tft.color565(0, 255, 0));
@@ -7083,7 +7083,7 @@ void setup() {
   bootTaskExit = false;
 
   // Libera os sprites da tela de boot (~310 KB de PSRAM, nunca mais usados) e liga o motor de apresentação
-  // (buffers de DMA em RAM interna, 2º buffer de quadro, tarefa de blit).
+  // (buffers de DMA em internal RAM, 2º buffer de quadro, tarefa de blit).
   boot_bg->freeAll();
   boot_loadingicon->freeAll();
   displayEngineBegin();
