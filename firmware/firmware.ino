@@ -6403,19 +6403,11 @@ static int l_inst_newindex(lua_State* L) {
 }
 
 void registerModel3D(lua_State* L) {
-  // Espelha registerSprite() exatamente — se ainda abortar, o problema nao e a API Model3D
-  Serial.printf("[R3D] top before=%d\n", lua_gettop(L)); Serial.flush();
-
-  Serial.println("[R3D] luaL_newmetatable..."); Serial.flush();
   luaL_newmetatable(L, "Model3D");
-  Serial.printf("[R3D] after newmetatable top=%d\n", lua_gettop(L)); Serial.flush();
 
-  Serial.println("[R3D] push gc..."); Serial.flush();
   lua_pushcfunction(L, l_model3d_gc);
-  Serial.println("[R3D] setfield __gc..."); Serial.flush();
   lua_setfield(L, -2, "__gc");
 
-  Serial.println("[R3D] index table..."); Serial.flush();
   lua_newtable(L);
   lua_pushcfunction(L, l_model3d_load);        lua_setfield(L, -2, "load");
   lua_pushcfunction(L, l_model3d_unload);      lua_setfield(L, -2, "unload");
@@ -6464,14 +6456,13 @@ void registerModel3D(lua_State* L) {
 
   lua_pop(L, 2);                                     // []
 
-  Serial.println("[R3D] ctor table..."); Serial.flush();
   lua_newtable(L);
   lua_newtable(L);
   lua_pushcfunction(L, l_model3d_new);
   lua_setfield(L, -2, "__call");
   lua_setmetatable(L, -2);
   lua_setglobal(L, "Model3D");
-  Serial.printf("[R3D] Model3D ok top=%d\n", lua_gettop(L)); Serial.flush();
+  Serial.printf("[R3D] Registered Model3D Api top=%d\n", lua_gettop(L)); Serial.flush();
 }
 
 // ---- Camera (singleton exposed as table of functions + optional userdata) ----
@@ -6668,9 +6659,9 @@ static int r3d_lua_panic(lua_State* L) {
 }
 
 void registerR3D(lua_State* L) {
-  Serial.println("[R3D] registerModel3D"); Serial.flush();
+  Serial.println("[R3D] registering Model3D"); Serial.flush();
   registerModel3D(L);
-  Serial.println("[R3D] lua_register globals"); Serial.flush();
+  Serial.println("[R3D] registering globals"); Serial.flush();
 
   lua_register(L, "Init3DRenderer", l_Init3DRenderer);
   lua_register(L, "Begin3DFrame", l_Begin3DFrame);
@@ -6689,7 +6680,7 @@ void registerR3D(lua_State* L) {
   lua_register(L, "Camera3D_Orbit", l_Camera3D_orbit);
   lua_register(L, "Camera3D_Freecam", l_Camera3D_freecam);
   lua_register(L, "Camera3D_Move", l_Camera3D_move);
-  Serial.println("[R3D] all globals ok"); Serial.flush();
+  Serial.println("[R3D] Registered APIs"); Serial.flush();
 }
 
 
