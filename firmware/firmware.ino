@@ -165,6 +165,7 @@ struct Model;           // defined later in R3D engine
 struct MeshletBuild;    // defined later
 struct RzMesh;          // packed mesh header from .rzobj
 struct LuaModel3D;      // Lua userdata wrapper
+struct TexCell { int x0, y0; uint32_t e00, e10, e01, e11; };   // cache da célula 2x2 do filtro de textura (ver texel3c)
 
 
 // ===== KERNEL SERVICES (forward declarations) =====
@@ -4014,7 +4015,9 @@ void registerFont(lua_State* L){
 #define SPAN_N        16    // a cada N pixels a textura é corrigida em perspectiva (menor = mais exato, mais lento)
 #define SPAN_FAR      32    // trecho maior, usado quando 1/w varia pouco no trecho (superfícies distantes/frontais)
 static_assert(SPAN_N >= 1 && SPAN_N <= SPAN_FAR, "SPAN_N deve estar entre 1 e SPAN_FAR");
-#define RENDER_DUALCORE 0   // 1 = raster dividido entre os 2 núcleos (faixas horizontais); 0 = só o núcleo do loop()
+#ifndef RENDER_DUALCORE
+#define RENDER_DUALCORE 1   // 1 = raster dividido entre os 2 núcleos (faixas horizontais); 0 = só o núcleo da task Lua
+#endif                      // o worker roda no núcleo 0 com prioridade 1 (abaixo do blit/kernel): só usa a folga que eles deixam
 #define RENDER_BANDS  6     // nº de faixas horizontais por quadro (distribuídas dinamicamente entre os núcleos)
                             // (com meshlets a duplicação de projeção por faixa é pequena: mais faixas = melhor balanço)
 
@@ -4397,6 +4400,43 @@ FORCE_INLINE uint16_t texel3(const uint16_t* __restrict tex, int32_t u, int32_t 
 #endif
 }
 
+// ---- versão com cache de célula (usada pelos laços de span) ----
+// Com a textura AMPLIADA (<= 1 texel por pixel) vários pixels seguidos caem na mesma célula 2x2 (x0,y0). Guardamos os 4 texels
+// já expandidos (ex565) e só recarregamos quando a célula muda: o resultado é IDÊNTICO ao texel3(), mas poupa 3 leituras da
+// PSRAM/internal + 3 expansões por pixel na maioria dos pixels. u,v chegam JÁ com o deslocamento de meio texel (-0x8000)
+// aplicado 1x no início do trecho (aritmética inteira: u += du é linear, então somar antes ou depois dá o mesmo valor).
+// (struct TexCell definida no topo do arquivo, junto dos tipos R3D: o Arduino gera protótipos antes dela)
+
+template<bool REP>
+FORCE_INLINE uint16_t texel3c(const uint16_t* __restrict tex, int32_t u, int32_t v, int tw, int tws, int twm, int thm, TexCell& c) {
+  const int x0 = u >> 16, y0 = v >> 16;
+  if (x0 != c.x0 || y0 != c.y0) {
+    int cx0, cx1, r0, r1;
+    if (REP) {
+      cx0 = x0 & twm; cx1 = (x0 + 1) & twm;
+      r0 = (y0 & thm) << tws; r1 = ((y0 + 1) & thm) << tws;
+    } else {
+      cx0 = x0 < 0 ? 0 : (x0 > twm ? twm : x0);  cx1 = x0 + 1 < 0 ? 0 : (x0 + 1 > twm ? twm : x0 + 1);
+      const int ya = y0 < 0 ? 0 : (y0 > thm ? thm : y0), yb = y0 + 1 < 0 ? 0 : (y0 + 1 > thm ? thm : y0 + 1);
+      r0 = ya * tw; r1 = yb * tw;
+    }
+    c.x0 = x0; c.y0 = y0;
+    c.e00 = ex565(tex[r0 + cx0]); c.e10 = ex565(tex[r0 + cx1]);
+    c.e01 = ex565(tex[r1 + cx0]); c.e11 = ex565(tex[r1 + cx1]);
+  }
+  const int fu = (u >> 11) & 31, fv = (v >> 11) & 31;
+  uint32_t e0, e1, e2, w0, w1, w2;
+  if (fu + fv < 32) { e0 = c.e00; e1 = c.e10; e2 = c.e01; w0 = 32 - fu - fv; w1 = fu; w2 = fv; }
+  else              { e0 = c.e11; e1 = c.e01; e2 = c.e10; w0 = fu + fv - 32; w1 = 32 - fu; w2 = 32 - fv; }
+  const uint32_t r = ((e0 * w0 + e1 * w1 + e2 * w2) >> 5) & 0x07E0F81Fu;
+  const uint32_t n = (r | (r >> 16)) & 0xFFFFu;
+#if TEX_BYTESWAPPED
+  return (uint16_t)(((n << 8) | (n >> 8)) & 0xFFFFu);
+#else
+  return (uint16_t)n;
+#endif
+}
+
 // AFF: uw/vw/duw/dvw já vêm em TEXELS (u,v lineares na tela); senão são u/w, v/w (perspectiva).
 template<bool TEX, bool AFF, bool REP, bool KEY, bool FILT>
 FORCE_INLINE void fillSpan(uint16_t* __restrict crow, uint16_t* __restrict zrow, int xs, int xe,
@@ -4423,9 +4463,11 @@ FORCE_INLINE void fillSpan(uint16_t* __restrict crow, uint16_t* __restrict zrow,
     int32_t u = (int32_t)(uw * 65536.0f), v = (int32_t)(vw * 65536.0f);
     const int32_t du = (int32_t)(duw * 65536.0f), dv = (int32_t)(dvw * 65536.0f);
     if (FILT && (du < 0 ? -du : du) <= FILT_LIM && (dv < 0 ? -dv : dv) <= FILT_LIM) {   // textura ampliada: filtra
+      TexCell cell; cell.x0 = cell.y0 = 0x7FFFFFFF;
+      u -= 0x8000; v -= 0x8000;                       // centro do texel (1x por span, não por pixel)
       for (int x = xs; x <= xe; ++x) {
         const int zi = z >> ZFRAC;
-        if (zi >= (int)zrow[x]) { crow[x] = texel3<REP>(tex, u, v, tw, tws, twm, thm); zrow[x] = (uint16_t)zi; }
+        if (zi >= (int)zrow[x]) { crow[x] = texel3c<REP>(tex, u, v, tw, tws, twm, thm, cell); zrow[x] = (uint16_t)zi; }
         z += dz; u += du; v += dv;
       }
       return;
@@ -4467,9 +4509,11 @@ FORCE_INLINE void fillSpan(uint16_t* __restrict crow, uint16_t* __restrict zrow,
     const int32_t du = (int32_t)((un - uc) * inv), dv = (int32_t)((vn - vc) * inv);
 
     if (FILT && (du < 0 ? -du : du) <= FILT_LIM && (dv < 0 ? -dv : dv) <= FILT_LIM) {   // este trecho está ampliado: filtra
+      TexCell cell; cell.x0 = cell.y0 = 0x7FFFFFFF;
+      u -= 0x8000; v -= 0x8000;
       for (int i = 0; i < n; ++i, ++x) {
         const int zi = z >> ZFRAC;
-        if (zi >= (int)zrow[x]) { crow[x] = texel3<REP>(tex, u, v, tw, tws, twm, thm); zrow[x] = (uint16_t)zi; }
+        if (zi >= (int)zrow[x]) { crow[x] = texel3c<REP>(tex, u, v, tw, tws, twm, thm, cell); zrow[x] = (uint16_t)zi; }
         z += dz; u += du; v += dv;
       }
     } else {
@@ -4880,7 +4924,7 @@ struct Model {
       f.close(); return false;
     }
     if (h.vertCount == 0 || h.indexCount < 3 || h.meshCount == 0) { f.close(); return false; }
-    Serial.printf("Carregando %s: %u verts, %u tris, %u sub-malhas, %u texturas\n", path,
+    Serial.printf("Loading %s: %u verts, %u tris, %u sub-meshes, %u textures\n", path,
                   (unsigned)h.vertCount, (unsigned)(h.indexCount / 3),
                   (unsigned)h.meshCount, (unsigned)h.texCount);
 
@@ -4914,17 +4958,17 @@ struct Model {
     // v4 com skin: 4 ossos + 4 pesos por vértice, logo depois dos índices
     const uint8_t* rawSk = nullptr;
     if (h.version >= 4 && (h.flags & RZ_SKIN)) {
-      uint8_t* k = (uint8_t*)(sSk.p = allocFast((size_t)h.vertCount * 8, "pesos (tmp)", false));
+      uint8_t* k = (uint8_t*)(sSk.p = allocFast((size_t)h.vertCount * 8, "weights (tmp)", false));
       if (!k || !readAll(f, k, (size_t)h.vertCount * 8)) { f.close(); return false; }
       rawSk = k;
     }
 
-    RzMesh* rm = (RzMesh*)(sMesh.p = allocFast(sizeof(RzMesh) * h.meshCount, "submalhas (tmp)", false));
+    RzMesh* rm = (RzMesh*)(sMesh.p = allocFast(sizeof(RzMesh) * h.meshCount, "submeshes (tmp)", false));
     if (!rm) { f.close(); return false; }
     for (uint32_t i = 0; i < h.meshCount; ++i) {
       if (!readAll(f, &rm[i], sizeof(RzMesh))) { f.close(); return false; }
       if ((uint64_t)rm[i].indexStart + rm[i].indexCount > h.indexCount) {
-        errf("%s: sub-malha %u fora do pool de indices", path, (unsigned)i);
+        errf("%s: submesh %u out of indices pool", path, (unsigned)i);
         f.close(); return false;
       }
     }
@@ -4937,17 +4981,17 @@ struct Model {
     MeshletBuild b = {};
     b.pos = rawPos; b.uv = rawUv; b.idx = rawIdx; b.V = h.vertCount; b.map = map;
     mbRun(b, rm, h.meshCount);                         // passada 1: só conta
-    if (b.nMl == 0) { errf("%s: nenhum triangulo valido", path); f.close(); return false; }
-    if (b.nMl > 32767) { errf("%s: meshlets demais (%u)", path, (unsigned)b.nMl); f.close(); return false; }
+    if (b.nMl == 0) { errf("%s: no valid triangle", path); f.close(); return false; }
+    if (b.nMl > 32767) { errf("%s: too much meshlets (%u)", path, (unsigned)b.nMl); f.close(); return false; }
     const uint32_t nMl = b.nMl, nV = b.nV, nT = b.nT;
 
     ml     = (Meshlet*)allocFast(sizeof(Meshlet) * (size_t)nMl, "meshlets", false);
     vpool  = (Vtx*)    allocFast(sizeof(Vtx) * (size_t)nV,       "vertices", false);
-    tpool  = (uint8_t*)allocFast(3 * (size_t)nT + 4,             "triangulos", false);
+    tpool  = (uint8_t*)allocFast(3 * (size_t)nT + 4,             "triangles", false);
     if (!ml || !vpool || !tpool) { f.close(); return false; }
     b.ml = ml; b.vp = vpool; b.tp = tpool;
     if (rawSk) {
-      vsk   = (uint8_t*)allocFast(8 * (size_t)nV,             "pesos",         false);
+      vsk   = (uint8_t*)allocFast(8 * (size_t)nV,             "weights",         false);
       vskin = (Vtx*)    allocFast(sizeof(Vtx) * (size_t)nV,   "vertices skin", false);
       if (!vsk || !vskin) { f.close(); return false; }
       b.sk = rawSk; b.sp = vsk;
@@ -4957,7 +5001,7 @@ struct Model {
     poolV = (int)nV;
     if (vskin) memcpy(vskin, vpool, sizeof(Vtx) * (size_t)nV);   // u,v copiados 1x; a cada pose só as posições mudam
     vdraw = vskin ? vskin : vpool;
-    Serial.printf("  %u meshlets, %u vertices (%.2fx do original), %u triangulos\n", (unsigned)nMl, (unsigned)nV,
+    Serial.printf("  %u meshlets, %u vertices (%.2fx of original), %u triangles\n", (unsigned)nMl, (unsigned)nV,
                   (double)nV / (double)h.vertCount, (unsigned)nT);
 
     sPos.release(); sUv.release(); sIdx.release(); sMesh.release(); sMap.release(); sSk.release();
@@ -5011,7 +5055,7 @@ struct Model {
     RzSkinHdr sh;
     if (!readAll(f, &sh, sizeof(sh))) return false;
     if (sh.boneCount == 0 || sh.boneCount > MAX_BONES || sh.clipCount > MAX_CLIPS) {
-      errf("esqueleto invalido: %u ossos (max %d), %u clipes (max %d)", (unsigned)sh.boneCount, MAX_BONES,
+      errf("invalid skeleton: %u bones (max %d), %u clips (max %d)", (unsigned)sh.boneCount, MAX_BONES,
            (unsigned)sh.clipCount, MAX_CLIPS);
       return false;
     }
@@ -5021,7 +5065,7 @@ struct Model {
     bones = (SkBone*)allocFast(sizeof(SkBone) * (size_t)bc, "ossos", false);
     if (!bones || !readAll(f, bones, sizeof(SkBone) * (size_t)bc)) return false;
     for (int i = 0; i < bc; ++i)
-      if (bones[i].parent >= i) { errf("osso %d: pai (%d) deve vir antes do filho", i, (int)bones[i].parent); return false; }
+      if (bones[i].parent >= i) { errf("bone %d: father (%d) must come before son", i, (int)bones[i].parent); return false; }
 
     animMem = (float*)allocFast(sizeof(float) * (size_t)bc * (10 * 3 + 12), "pose/anim", true);
     if (!animMem) return false;
@@ -5035,7 +5079,7 @@ struct Model {
       for (int i = 0; i < (int)sh.clipCount; ++i) {
         RzClipEntry e;
         if (!readAll(f, &e, sizeof(e))) return false;
-        if (e.nFrames == 0) { errf("clipe %d sem quadros", i); return false; }
+        if (e.nFrames == 0) { errf("clip %d with no keyframes", i); return false; }
         memcpy(clips[i].name, e.name, sizeof(e.name));
         clips[i].name[sizeof(clips[i].name) - 1] = 0;
         clips[i].nFrames = e.nFrames; clips[i].flags = e.flags; clips[i].duration = e.duration;
@@ -5604,10 +5648,22 @@ static std::atomic<int> gBandsDone(0);
 static TaskHandle_t gMasterTask = nullptr;
 static TaskHandle_t gWorkerTask = nullptr;
 
+// ---- PROFILER (R3D_PROFILE 1): imprime no Serial, 1x por segundo, onde o tempo de cada quadro 3D vai ----
+#ifndef R3D_PROFILE
+#define R3D_PROFILE 1
+#endif
+#if R3D_PROFILE
+static std::atomic<int> gProfBands[2];          // faixas desenhadas por contexto (0 = task Lua, 1 = worker do núcleo 0)
+static uint32_t gProfPrepUs = 0;                // prepare(): frustum + sort dos meshlets (serial, só a task Lua)
+#endif
+
 static void renderBands(int ctx) {
   for (;;) {
     const int b = gNextBand.fetch_add(1);
     if (b >= gBands) break;
+#if R3D_PROFILE
+    gProfBands[ctx]++;
+#endif
 
     // gJob só é lido DEPOIS de reivindicar uma faixa (o mestre publica gJob antes de zerar o contador)
     Target T;
@@ -5889,7 +5945,13 @@ static void r3dRenderTo(uint16_t* color) {
   }
     gJob.n = n;
 
+#if R3D_PROFILE
+  const int64_t tPrep0 = esp_timer_get_time();
+#endif
   for (int i = 0; i < n; ++i) gJob.model[i]->prepare(gJob.mvp[i], camera.nearZ);
+#if R3D_PROFILE
+  gProfPrepUs += (uint32_t)(esp_timer_get_time() - tPrep0);
+#endif
 
   gBands = gWorkerTask ? RENDER_BANDS : 1;   // publicado antes de liberar o contador
   gBandsDone.store(0);
@@ -6462,7 +6524,7 @@ void registerModel3D(lua_State* L) {
 // ---- Camera (singleton exposed as table of functions + optional userdata) ----
 int l_Init3DRenderer(lua_State* L) {
   int div = 2, bands = 6;
-  bool dual = false;  // safer default; enable dualCore=true after stable
+  bool dual = (RENDER_DUALCORE != 0);  // padrão: usa o worker do núcleo 0; Init3DRenderer{dualCore=false} desliga por app
   if (lua_istable(L, 1)) {
     lua_getfield(L, 1, "renderDiv"); if (lua_isnumber(L, -1)) div = (int)lua_tointeger(L, -1); lua_pop(L, 1);
     lua_getfield(L, 1, "bands"); if (lua_isnumber(L, -1)) bands = (int)lua_tointeger(L, -1); lua_pop(L, 1);
@@ -6558,8 +6620,30 @@ int l_Render3D(lua_State* L) {
     // Pega um buffer de cor livre (se os 2 estão ocupados, o SPI é o gargalo e é aqui que o Lua espera),
     // rasteriza nele e entrega pra tarefa de blit: o próximo quadro já começa a ser rasterizado durante o envio.
     int idx = 0;
+#if R3D_PROFILE
+    static int64_t pEndPrev = 0, pAcc[4] = {0, 0, 0, 0}, pT0 = 0;   // [0] lógica Lua entre quadros, [1] espera de buffer, [2] raster, [3] quadros
+    const int64_t pA = esp_timer_get_time();
+    if (pEndPrev) pAcc[0] += pA - pEndPrev;
+#endif
     xQueueReceive(freeQ, &idx, portMAX_DELAY);
+#if R3D_PROFILE
+    const int64_t pB = esp_timer_get_time();
+#endif
     r3dRenderTo(colorBuf[idx]);
+#if R3D_PROFILE
+    const int64_t pC = esp_timer_get_time();
+    pAcc[1] += pB - pA; pAcc[2] += pC - pB; pAcc[3]++;
+    pEndPrev = pC;
+    if (!pT0) pT0 = pC;
+    if (pC - pT0 >= 1000000) {
+      const double n = (double)pAcc[3], bw = (double)(gProfBands[0].load() + gProfBands[1].load());
+      Serial.printf("[R3D PROF] %.1f fps | por quadro: lua %.2f ms, espera SPI %.2f ms, raster %.2f ms (prepare %.2f) | worker fez %.0f%% das faixas\n",
+                    n * 1e6 / (double)(pC - pT0), pAcc[0] / n / 1000.0, pAcc[1] / n / 1000.0, pAcc[2] / n / 1000.0,
+                    (double)gProfPrepUs / n / 1000.0, bw > 0 ? 100.0 * gProfBands[1].load() / bw : 0.0);
+      pAcc[0] = pAcc[1] = pAcc[2] = pAcc[3] = 0; pT0 = pC; gProfPrepUs = 0;
+      gProfBands[0] = 0; gProfBands[1] = 0;
+    }
+#endif
     gR3DLast = idx;
     if (doPresent) {
       gR3DPending++;
