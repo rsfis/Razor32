@@ -42,7 +42,13 @@
 #define KERNEL_VERSION "ALPHA 0.2.9"
 
 #define LUA_HEAP_LIMIT (7 * 1024 * 1024)
-#define LUA_TASK_STACK 49152
+// Task stacks live in INTERNAL RAM. The Lua task used to take 48 KB (and the boot animation task another 48 KB for a trivial
+// loop). Every KB here is a KB the 3D buffers (z + 2 colors, ~75 KB each) can use. The Lua task logs its stack high-water mark
+// when a program ends ("[LUA] stack ..."): if "min free" is always > 8 KB you can lower LUA_TASK_STACK further.
+#ifndef LUA_TASK_STACK
+#define LUA_TASK_STACK 16384
+#endif
+#define BOOT_TASK_STACK 6144
 
 #define SD_CS 4
 
@@ -129,7 +135,7 @@
 #ifndef BLIT_SLEEP
 #define BLIT_SLEEP 1        // 1 = sleep on a high-resolution timer while DMA runs (instead of busy-wait)
 #endif
-#define DMA_CHUNK_PIXELS (480 * 16)   // pixels per DMA block (2 buffers in internal RAM: ~30 KB)
+#define DMA_CHUNK_PIXELS (480 * 8)    // pixels per DMA block (2 buffers in internal RAM: ~15 KB; was 480*16 = ~30 KB)
 
 const char* ntpServer = "pool.ntp.org";
 long gmtOffset_sec = -3 * 3600;  // UTC-3
@@ -276,6 +282,12 @@ DirtyList frameDirtyAccum;  // what was drawn in THIS frame (between clear and u
 DirtyList frameDirtyPrev;   // what was drawn (and therefore remained visible) in the previous frame
 bool frameEverPushed = false;
 
+// Temporary/bulk buffers (PNG file, Lua script text...) go to PSRAM first so they never fragment or consume internal RAM.
+static inline void* psramFirstAlloc(size_t n) {
+  void* p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  return p ? p : malloc(n);            // free() accepts both
+}
+
 void clampRectToScreen(int &x, int &y, int &w, int &h) {
   if (x < 0) { w += x; x = 0; }
   if (y < 0) { h += y; y = 0; }
@@ -352,7 +364,7 @@ static uint32_t hmixStr(uint32_t h, const char* t) {
   return hmix(h, 0xFFu);
 }
 
-#define CMD_MAX 256
+#define CMD_MAX 128
 struct CmdRec { uint32_t h; IRect r; };
 static CmdRec gCmdBufA[CMD_MAX], gCmdBufB[CMD_MAX];
 static CmdRec* gCmdCur = gCmdBufA;       // comandos do quadro em desenho
@@ -689,11 +701,12 @@ static void displayEngineBegin() {
 
   gPresentMutex = xSemaphoreCreateMutex();
 
-  // toast pré-renderizado: 200x26 em internal RAM
-  toastSpr.setPsram(false);
+  // toast pré-renderizado: 200x26 (~10 KB). Fica na PSRAM: só é lido (por blocos) enquanto o toast está na tela,
+  // e assim libera ~10 KB de internal RAM para os buffers 3D.
+  toastSpr.setPsram(true);
   toastSpr.setColorDepth(16);
   gToastOk = (toastSpr.createSprite(TOAST_W, TOAST_H) != nullptr);
-  if (!gToastOk) Serial.println("WARN: no internal RAM for toast (notifications disabled)");
+  if (!gToastOk) Serial.println("WARN: no memory for toast (notifications disabled)");
 
   gAsync = false;
 #if ASYNC_PRESENT
@@ -988,7 +1001,7 @@ struct Sprite {
     }
 
     size_t tamanho = f.size();
-    uint8_t* buffer = (uint8_t*)malloc(tamanho);
+    uint8_t* buffer = (uint8_t*)psramFirstAlloc(tamanho);
     if (!buffer) {
       tft.setTextColor(TFT_WHITE);
       tft.setCursor(5, 5);
@@ -4008,8 +4021,12 @@ void registerFont(lua_State* L){
 
 // ============================ CONFIG ============================
 #define RENDER_DIV    2     // resolução interna = tela / RENDER_DIV (o blit assume 2 => 240x160)
-#define CHUNK_HR      8     // linhas internas por bloco de DMA
+#define CHUNK_HR      4     // linhas internas por bloco de DMA (4 => 8 linhas de tela = 480*8 px, cabe nos blocos de DMA de 15 KB)
 #define INTERNAL_RESERVE (40 * 1024) // internal RAM que nunca é consumida pelos buffers
+#define R3D_INTERNAL_RESERVE (48 * 1024) // internal RAM que SEMPRE sobra depois de alocar z/cores 3D (Wi-Fi/BLE precisam disso ao ligar)
+#define R3D_Z_RESERVE (16 * 1024)        // reserva menor só para o z-buffer: ele tem prioridade absoluta na internal RAM
+#define R3D_COLORA_RESERVE (10 * 1024)   // cor A (buffer principal do 3D): prioridade logo depois do z-buffer
+#define R3D_FREE_ON_EXIT 1  // 1 = ao sair do programa 3D, derruba as tasks 3D e devolve z/cores (~225 KB) ao heap
 #define FORCE_PSRAM   0     // 0 = buffers "quentes" (z, cores) tentam internal RAM e caem pra PSRAM sozinhos
                             // 1 = tudo na PSRAM (comportamento antigo, bem mais lento)
 #define SPAN_N        16    // a cada N pixels a textura é corrigida em perspectiva (menor = mais exato, mais lento)
@@ -5853,6 +5870,37 @@ static void r3dResetLayers() {
   gLastLayerIdx = -1;
 }
 
+static bool gR3DOwnDma = false;    // dmaBuf[] é nosso (não é o par gDmaBuf do motor 2D) => liberar no shutdown
+
+// Buffer "quente" do 3D: internal RAM se sobrar R3D_INTERNAL_RESERVE depois dele (e houver bloco contíguo), senão PSRAM.
+static void* r3dAllocBuf(size_t bytes, const char* name, size_t reserve) {
+  void* p = nullptr;
+  const char* where = "internal RAM";
+#if !FORCE_PSRAM
+  const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+  if (heap_caps_get_free_size(caps) >= bytes + reserve &&
+      heap_caps_get_largest_free_block(caps) >= bytes)
+    p = heap_caps_malloc(bytes, caps);
+#endif
+  if (!p) { p = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); where = "PSRAM"; }
+  Serial.printf("  %-14s %7u B -> %s\n", name, (unsigned)bytes, p ? where : "FALHOU!");
+  return p;
+}
+
+static void r3dFreeBuffers() {
+  if (colorBuf[1] && colorBuf[1] != colorBuf[0]) heap_caps_free(colorBuf[1]);
+  if (colorBuf[0]) heap_caps_free(colorBuf[0]);
+  if (zBuf)        heap_caps_free(zBuf);
+  colorBuf[0] = colorBuf[1] = nullptr;
+  zBuf = nullptr;
+  if (gR3DOwnDma) {
+    if (dmaBuf[0]) heap_caps_free(dmaBuf[0]);
+    if (dmaBuf[1]) heap_caps_free(dmaBuf[1]);
+    gR3DOwnDma = false;
+  }
+  dmaBuf[0] = dmaBuf[1] = nullptr;
+}
+
 static bool r3dInit(int renderDiv, bool dualCore) {
   if (gR3DReady) { r3dResetLayers(); return true; }
   Serial.printf("[R3D] init div=%d dual=%d free heap=%u free psram=%u\n",
@@ -5872,23 +5920,31 @@ static bool r3dInit(int renderDiv, bool dualCore) {
 
   const size_t total = (size_t)HR_W * HR_H;
   const size_t dmaBytes = (size_t)CHUNK_HR * 2 * SCR_W * 2;
-  // DMA scratch must be internal; frame color/z can be PSRAM
+  // DMA scratch must be internal. z / colors are the "hot" buffers (touched per pixel): they go to INTERNAL RAM when it fits.
   // Os blocos de DMA do motor de tela 2D (mesmo tamanho, internal RAM) servem aqui também: o acesso ao painel já é
   // serializado por gPresentMutex, então não precisa de mais 30 KB de internal RAM.
+  gR3DOwnDma = false;
   if (gDmaBuf[0] && gDmaBuf[1] && dmaBytes <= (size_t)DMA_CHUNK_PIXELS * 2) {
     dmaBuf[0] = gDmaBuf[0];
     dmaBuf[1] = gDmaBuf[1];
   } else {
     dmaBuf[0] = (uint16_t*)heap_caps_malloc(dmaBytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     dmaBuf[1] = (uint16_t*)heap_caps_malloc(dmaBytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    gR3DOwnDma = true;
   }
-  zBuf        = (uint16_t*)allocFast(total * 2, "r3d zbuffer", false);  // PSRAM: internal is tight with OS framebufs
-  colorBuf[0] = (uint16_t*)allocFast(total * 2, "r3d color A", false);
-  colorBuf[1] = (uint16_t*)heap_caps_malloc(total * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);   // 2o quadro: permite o blit assíncrono
-  if (!colorBuf[1]) colorBuf[1] = colorBuf[0];   // sem PSRAM: cai no caminho síncrono (1 buffer)
+  Serial.printf("[R3D] internal RAM before buffers: free=%u largest block=%u\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  // Prioridade de internal RAM: z-buffer (lê + escreve por pixel) > cor A > cor B (2o quadro do blit assíncrono).
+  // Cada um cai sozinho para a PSRAM se não couber.
+  zBuf        = (uint16_t*)r3dAllocBuf(total * 2, "r3d zbuffer", R3D_Z_RESERVE);
+  colorBuf[0] = (uint16_t*)r3dAllocBuf(total * 2, "r3d color A", R3D_COLORA_RESERVE);
+  colorBuf[1] = (uint16_t*)r3dAllocBuf(total * 2, "r3d color B", R3D_INTERNAL_RESERVE);   // 2o quadro: permite o blit assíncrono
+  if (!colorBuf[1]) colorBuf[1] = colorBuf[0];   // sem memória: cai no caminho síncrono (1 buffer)
   if (!zBuf || !colorBuf[0] || !dmaBuf[0] || !dmaBuf[1]) {
     Serial.println("[R3D] buffer alloc FAILED");
     errf("r3dInit: buffer alloc failed");
+    r3dFreeBuffers();
     return false;
   }
 
@@ -5918,6 +5974,40 @@ static bool r3dInit(int renderDiv, bool dualCore) {
                 HR_W, HR_H, SCR_W, SCR_H, RENDER_BANDS, (int)(gWorkerTask != nullptr), (int)gR3DAsync,
                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
   return true;
+}
+
+// Devolve ao heap tudo que r3dInit pegou (z + 2 cores ~225 KB, stacks do blit/raster). Chamado quando o programa 3D sai:
+// um programa 2D (home, apps) não precisa deles e o Wi-Fi/BLE ganham internal RAM de volta. Um novo Init3DRenderer() recria tudo.
+static void r3dShutdown() {
+#if R3D_FREE_ON_EXIT
+  if (!gR3DReady) return;
+  const uint32_t t0 = millis();
+  while (gR3DPending.load() > 0 && (millis() - t0) < 500) vTaskDelay(1);
+  if (gR3DPending.load() > 0) { Serial.println("[R3D] shutdown skipped: a frame is still in flight"); return; }
+
+  if (gPresentMutex) xSemaphoreTake(gPresentMutex, portMAX_DELAY);   // nenhum blit 2D/toast lendo as camadas 3D agora
+  gLastLayerIdx = -1;
+  gLayerSrcIdx = -1;
+  gLayerPrevShown = 0;
+
+  // tasks: ambas estão bloqueadas (fila / notificação) porque não há quadro em voo e o mestre só volta depois das faixas
+  if (gWorkerTask) { vTaskDelete(gWorkerTask); gWorkerTask = nullptr; }
+  if (gR3DBlitTask) { vTaskDelete(gR3DBlitTask); gR3DBlitTask = nullptr; }
+  if (gR3DBlitTimer) { esp_timer_stop(gR3DBlitTimer); esp_timer_delete(gR3DBlitTimer); gR3DBlitTimer = nullptr; }
+  if (freeQ) { vQueueDelete(freeQ); freeQ = nullptr; }
+  if (fullQ) { vQueueDelete(fullQ); fullQ = nullptr; }
+  gR3DAsync = false;
+  gR3DHeld = -1;
+  gR3DLast = 0;
+  gR3DQueueN = 0;
+
+  r3dFreeBuffers();
+  gR3DReady = false;
+  if (gPresentMutex) xSemaphoreGive(gPresentMutex);
+  Serial.printf("[R3D] shutdown: internal free=%u largest=%u\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+#endif
 }
 
 static void r3dQueueClear() { gR3DQueueN = 0; }
@@ -6762,11 +6852,31 @@ void registerR3D(lua_State* L) {
 }
 
 
+int l_OS_PrintMemReport(lua_State* L){
+  Serial.printf("[KERNEL] Memory Report by ");
+  Serial.printf(luaL_checkstring(L, 1));
+  Serial.printf("\n");
+  if (ESP.getPsramSize() > 0) {
+    Serial.printf("PSRAM Length: %.2f MB\n", ESP.getPsramSize() / 1048576.0);
+    Serial.printf("Available PSRAM: %.2f MB\n", ESP.getFreePsram() / 1048576.0);
+  } else {
+    Serial.println("PSRAM not found.");
+  }
+  Serial.println("=== RAM ===");
+  Serial.printf("RAM Length (Heap): %.2f MB\n", ESP.getHeapSize() / 1048576.0);
+  Serial.printf("Available RAM: %.2f MB\n", ESP.getFreeHeap() / 1048576.0);
+
+  Serial.println("=====================");
+
+  return 0;
+}
+
 
 // ===== RESGISTER EXPORTED FUNCTIONS =====
 void registerApis(lua_State* L) {
   //lua_register(L, "teste", l_teste);
   lua_register(L, "endProgram", l_endProgram);
+  lua_register(L, "OS_PrintMemReport", l_OS_PrintMemReport);
   lua_register(L, LUA_CLEAR_SCREEN_DEFINITION, l_clearScreen);
   lua_register(L, LUA_UPDATE_SCREEN_DEFINITION, l_updateScreen);
   lua_register(L, LUA_GET_FREE_MEMORY_DEFINITION, l_getFreeMemory);
@@ -6836,6 +6946,7 @@ static void programUnloadKernelState() {
   // --- 3D: fila de modelos, buffers de cor presos / camada pendente e câmera ---
   r3dQueueClear();
   r3dResetLayers();
+  r3dShutdown();
   camera = Camera();
 
   // --- Tela 2D: buffers de quadro pretos e todo o rastreio de retângulos sujos / diff de comandos zerado ---
@@ -6912,7 +7023,7 @@ static bool runLuaProgram(const char* scriptPath) {
 
   size_t size = f.size();
   Serial.printf("[LUA] script size=%u\n", (unsigned)size); Serial.flush();
-  char* buffer = (char*)malloc(size + 1);
+  char* buffer = (char*)psramFirstAlloc(size + 1);
   if (!buffer) {
     Serial.println("ERR: No RAM available for script");
     Serial.flush();
@@ -6949,6 +7060,9 @@ static bool runLuaProgram(const char* scriptPath) {
   const bool switching = gNextProgramReq;
   lua_sethook(L, NULL, 0, 0);
   luaRequestExit = false;
+
+  Serial.printf("[LUA] stack: size=%u B, min free (high-water)=%u B\n",
+                (unsigned)LUA_TASK_STACK, (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
   const uint32_t psramBefore = (uint32_t)ESP.getFreePsram();
   const uint32_t heapBefore  = (uint32_t)ESP.getFreeHeap();
@@ -7104,7 +7218,7 @@ void setup() {
   xTaskCreatePinnedToCore(
     taskDrawBootImages,
     "DrawBootImages",
-    LUA_TASK_STACK,
+    BOOT_TASK_STACK,
     NULL,
     2,
     &bootTaskHandle,
@@ -7212,4 +7326,6 @@ void setup() {
 
 void loop() {
   // KERNEL
+  // Everything runs in its own tasks: the Arduino loopTask (8 KB of internal RAM stack) is no longer needed.
+  vTaskDelete(NULL);
 }
