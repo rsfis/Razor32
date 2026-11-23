@@ -64,6 +64,7 @@
 #define LUA_GET_USER_PASSWORD_DEFINITION "OS_GetUserPassword"
 #define LUA_OS_SLEEP_DEFINITION "OS_Sleep"
 #define LUA_OS_RESTART_DEFINITION "OS_Restart"
+#define LUA_OS_START_PROGRAM_DEFINITION "OS_StartProgram"
 #define LUA_OS_GET_KERNEL_VERSION_DEFINITION "OS_GetKernelVersion"
 #define LUA_OS_SAVE_BIOS_CONFIGURATION_DEFINITION "OS_SaveBiosConfig"
 #define LUA_OS_SAVE_SYSTEM_CONFIGURATION_DEFINITION "OS_SaveSystemConfig"
@@ -109,6 +110,14 @@
 #define TOGGLE_KEY_COOLDOWN_MS 2000   // timer de utilização das duas teclas
 #define KERNEL_KEY_DEBUG 0            // 1 = imprime no Serial as teclas que o kernel vê (pra diagnóstico)
 #define TOAST_DURATION_MS 1500        // tempo da notificação rápida na tela
+
+// ===== HOME =====
+// Tecla tratada pelo kernel (página 2 + CAPSLOCK, como o WifiToggle): derruba o programa atual e sobe o /sys/src/sys.lua.
+#define KEY_HOME "HOME"
+#define HOME_PROGRAM_PATH "/sys/src/sys.lua"
+#define HOME_RELOAD_IF_ALREADY_HOME 0   // 1 = HOME recarrega o sys.lua mesmo se ele já for o programa rodando
+#define HOME_FORCE_RESTART_MS 3000      // último recurso: programa Lua preso (sem chamar nenhuma API) => esp_restart() (0 = desliga)
+#define KB_DEFAULT_DELAY_MS 300         // delay anti-flood padrão do teclado (OS_SetKeyboardDelay muda; a troca de programa restaura)
 
 // ===== DISPLAY (mesmas técnicas de tela do 3d_models) =====
 #ifndef SPI_WRITE_HZ
@@ -1129,6 +1138,41 @@ typedef struct {
 //  return 0;
 //}
 
+// ===== TROCA DE PROGRAMA (OS_StartProgram e tecla HOME) =====
+// Qualquer task pede a troca com requestProgramSwitch(); a task Lua desenrola o programa atual (erro "program switch"
+// em qualquer API chamada / em toda instrução), destrói a VM e sobe o próximo caminho numa VM nova.
+#define LUA_PROGRAM_PATH_MAX 160
+static char gNextProgramPath[LUA_PROGRAM_PATH_MAX];
+static volatile bool gNextProgramReq = false;
+static volatile bool gCurrentIsHome = false;     // o sys.lua está rodando (script ainda não terminou)
+static portMUX_TYPE gProgMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Enquanto houver troca pendente, TODA instrução Lua levanta erro: assim nem um pcall() do programa
+// consegue "engolir" o pedido de encerramento — a pilha desenrola até o luaL_dostring da task.
+static void luaStartProgramHook(lua_State* L, lua_Debug* ar) {
+  (void)ar;
+  if (gNextProgramReq) luaL_error(L, "program switch");
+}
+
+// SÓ a task Lua chama (o hook é instalado na própria thread da VM, nunca de outro núcleo)
+static int luaAbortForSwitch(lua_State* L) {
+  lua_sethook(L, luaStartProgramHook, LUA_MASKCOUNT, 1);
+  return luaL_error(L, "program switch");
+}
+
+// Ponto de aborto cooperativo: chamado no começo das APIs que todo programa usa (tela, teclado, sleep, 3D)
+static inline void luaSwitchCheck(lua_State* L) {
+  if (gNextProgramReq) luaAbortForSwitch(L);
+}
+
+// Qualquer task pode chamar
+static void requestProgramSwitch(const char* path) {
+  portENTER_CRITICAL(&gProgMux);
+  strlcpy(gNextProgramPath, path, sizeof(gNextProgramPath));
+  gNextProgramReq = true;
+  portEXIT_CRITICAL(&gProgMux);
+}
+
 int l_endProgram(lua_State* L) {
   Serial.println("[Lua] Requesting VM shutdown");
   luaRequestExit = true;
@@ -1136,6 +1180,7 @@ int l_endProgram(lua_State* L) {
 }
 
 int l_clearScreen(lua_State* L) {
+  luaSwitchCheck(L);
   // Preguicoso: so anota as regioes que precisam voltar pra preto (as do buffer ha 2 quadros + as ja desenhadas neste
   // ciclo). O memset roda no 1o desenho que nao as cobre por inteiro, ou no Display_UpdateScreen.
   DirtyList& old = bufDirty[gDrawIdx];
@@ -1152,6 +1197,7 @@ int l_clearScreen(lua_State* L) {
 }
 
 int l_updateScreen(lua_State* L){
+  luaSwitchCheck(L);      // HOME / OS_StartProgram pendente: nem envia mais um quadro do programa que está saindo
   flushClear();           // o buffer precisa estar preto fora do que foi desenhado antes de ir pro painel
 
   DirtyList push;
@@ -2554,7 +2600,7 @@ const char* const kbLayout[3][KB_ROWS][KB_COLS] = {
 bool kbMatrix[KB_ROWS][KB_COLS];       // [linha][coluna], true = pressionada
 volatile uint8_t kbLayer = 0;                   // página atual (0 ou 1)
 volatile bool kbCapsLock = false;               // CAPSLOCK ativo -> letras maiúsculas
-volatile uint32_t kbDelayMs = 300;     // delay global anti-flood (ms)
+volatile uint32_t kbDelayMs = KB_DEFAULT_DELAY_MS;     // delay global anti-flood (ms)
 uint32_t kbLastAcceptMs = 0;
 bool kbTimerStarted = false;
 SemaphoreHandle_t kbScanMutex = nullptr;   // o Lua e a task do kernel escaneiam a mesma matriz
@@ -2661,6 +2707,7 @@ int l_OS_SetKeyboardDelay(lua_State* L) {
 // Retorna o nome da tecla pressionada (apenas uma) ou nil se nenhuma / timer em andamento.
 int l_OS_GetPressedKey(lua_State* L) {
   kernelLuaCheckpoint();
+  luaSwitchCheck(L);
 
   if (!keyboardTimerReady()) {
     lua_pushnil(L);
@@ -2697,6 +2744,7 @@ int l_OS_IsKeyPressed(lua_State* L) {
   const char* key = luaL_checkstring(L, 1);
 
   kernelLuaCheckpoint();
+  luaSwitchCheck(L);
 
   if (!keyboardTimerReady()) {
     lua_pushboolean(L, 0);
@@ -3349,10 +3397,22 @@ static void kernelRunBluetoothDialog() {
   bleAskState = answer ? 2 : 3;
 }
 
-// ----- Task do kernel: teclas WifiToggle/BluetoothToggle, toast e dialog -----
+// ----- HOME: volta pro /sys/src/sys.lua -----
+static volatile uint32_t gHomeWatchMs = 0;   // 0 = sem pedido de HOME pendente; senão, quando ele foi (re)armado
+
+static void kernelGoHome() {
+#if !HOME_RELOAD_IF_ALREADY_HOME
+  if (gCurrentIsHome && !gNextProgramReq) return;   // já está no sys.lua
+#endif
+  Serial.println("[Kernel] HOME -> " HOME_PROGRAM_PATH);
+  requestProgramSwitch(HOME_PROGRAM_PATH);
+  gHomeWatchMs = millis() | 1;
+}
+
+// ----- Task do kernel: teclas WifiToggle/BluetoothToggle/HOME, toast e dialog -----
 static void kernelTask(void* arg) {
   bool m[KB_ROWS][KB_COLS];
-  bool wifiHeld = false, btHeld = false;
+  bool wifiHeld = false, btHeld = false, homeHeld = false;
   bool funcHeld = false, capsHeld = false;
   bool wifiUsed = false, btUsed = false;
   uint32_t wifiLastMs = 0, btLastMs = 0;
@@ -3385,7 +3445,7 @@ static void kernelTask(void* arg) {
     capsHeld = capsDown;
 
     const uint8_t layer = keyboardEffectiveLayer();
-    bool wifiDown = false, btDown = false;
+    bool wifiDown = false, btDown = false, homeDown = false;
 
     for (int l = 0; l < KB_ROWS; l++) {
       for (int c = 0; c < KB_COLS; c++) {
@@ -3400,6 +3460,7 @@ static void kernelTask(void* arg) {
 #endif
         if (strcmp(name, KEY_WIFI_TOGGLE) == 0) wifiDown = true;
         else if (strcmp(name, KEY_BLUETOOTH_TOGGLE) == 0) btDown = true;
+        else if (strcmp(name, KEY_HOME) == 0) homeDown = true;
       }
     }
 
@@ -3427,6 +3488,25 @@ static void kernelTask(void* arg) {
     }
     btHeld = btDown;
 
+    // HOME: uma ação por aperto (borda). Sem timer de 2 s: voltar pra home tem que responder sempre.
+    if (homeDown && !homeHeld) kernelGoHome();
+    homeHeld = homeDown;
+
+#if HOME_FORCE_RESTART_MS > 0
+    // Último recurso: se o programa não desenrolou (laço Lua sem chamar nenhuma API), reinicia. O boot sobe o sys.lua.
+    if (gHomeWatchMs) {
+      if (!gNextProgramReq) {
+        gHomeWatchMs = 0;                               // a task Lua já pegou o pedido
+      } else if (!luaTaskAlive || luaPauseReq) {
+        gHomeWatchMs = millis() | 1;                    // VM ociosa ou pausada pelo kernel: ainda não é travamento
+      } else if ((uint32_t)(millis() - gHomeWatchMs) >= HOME_FORCE_RESTART_MS) {
+        Serial.println("[Kernel] HOME: programa nao respondeu, reiniciando");
+        Serial.flush();
+        esp_restart();
+      }
+    }
+#endif
+
     vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
@@ -3438,14 +3518,56 @@ void kernelServicesBegin() {
 
 int l_OS_Sleep(lua_State* L){
   kernelLuaCheckpoint();
-  delay(luaL_checkinteger(L, 1));
+  lua_Integer ms = luaL_checkinteger(L, 1);
+  if (ms < 0) ms = 0;
+  // Dorme em fatias de 10 ms: HOME / OS_StartProgram não esperam um sleep longo terminar
+  const uint32_t t0 = millis();
+  while (!gNextProgramReq) {
+    const uint32_t el = millis() - t0;
+    if (el >= (uint32_t)ms) break;
+    const uint32_t left = (uint32_t)ms - el;
+    delay(left < 10 ? left : 10);
+  }
   kernelLuaCheckpoint();
+  luaSwitchCheck(L);
   return 0;
 }
 
 int l_OS_Restart(lua_State* L){
   esp_restart();
   return 0;
+}
+
+// ===== OS_StartProgram(path) =====
+// Fecha o programa Lua atual (a VM inteira é destruída e o estado do kernel que ele deixou é limpo, ver
+// programUnloadKernelState) e abre o programa em `path` numa VM nova.
+// Se o arquivo não existir, devolve nil, "mensagem" e o programa atual continua rodando.
+// Em caso de sucesso NÃO retorna: a execução do programa atual é abortada e a task Lua troca de programa.
+int l_OS_StartProgram(lua_State* L){
+  Serial.println("[Kernel] Starting Another Program");
+  const char* path = luaL_checkstring(L, 1);
+  size_t len = strlen(path);
+  if (len == 0 || len >= LUA_PROGRAM_PATH_MAX) {
+    lua_pushnil(L);
+    lua_pushstring(L, "invalid path");
+    return 2;
+  }
+
+  // garante a barra inicial (SD.open exige caminho absoluto)
+  char full[LUA_PROGRAM_PATH_MAX];
+  if (path[0] == '/') snprintf(full, sizeof(full), "%s", path);
+  else snprintf(full, sizeof(full), "/%s", path);
+
+  kernelLuaCheckpoint();
+  if (!SD.exists(full)) {
+    lua_pushnil(L);
+    lua_pushfstring(L, "file not found: %s", full);
+    return 2;
+  }
+
+  Serial.printf("[Lua] OS_StartProgram -> %s\n", full);
+  requestProgramSwitch(full);
+  return luaAbortForSwitch(L);   // desenrola o programa atual
 }
 
 int l_OS_GetKernelVersion(lua_State* L){
@@ -6433,6 +6555,7 @@ int l_Camera3D_move(lua_State* L) {
 
 // Begin3DFrame: clear draw queue
 int l_Begin3DFrame(lua_State* L) {
+  luaSwitchCheck(L);
   if (!gR3DReady) return luaL_error(L, "Init3DRenderer() first");
   r3dQueueClear();
   return 0;
@@ -6441,6 +6564,7 @@ int l_Begin3DFrame(lua_State* L) {
 // Render3D(): rasterize all models queued via :draw(), present full-screen via DMA blit
 // Optional: Render3D(false) skips present (leaves pixels in internal buffer)
 int l_Render3D(lua_State* L) {
+  luaSwitchCheck(L);
   if (!gR3DReady) return luaL_error(L, "Init3DRenderer() first");
   bool doPresent = lua_isnoneornil(L, 1) ? true : lua_toboolean(L, 1);
 
@@ -6587,6 +6711,7 @@ void registerApis(lua_State* L) {
   lua_register(L, LUA_GET_USER_PASSWORD_DEFINITION, l_getUserPassword);
   lua_register(L, LUA_OS_SLEEP_DEFINITION, l_OS_Sleep);
   lua_register(L, LUA_OS_RESTART_DEFINITION, l_OS_Restart);
+  lua_register(L, LUA_OS_START_PROGRAM_DEFINITION, l_OS_StartProgram);
   lua_register(L, LUA_OS_GET_KERNEL_VERSION_DEFINITION, l_OS_GetKernelVersion);
   lua_register(L, LUA_OS_SET_KEYBOARD_DELAY_DEFINITION, l_OS_SetKeyboardDelay);
   lua_register(L, LUA_OS_GET_PRESSED_KEY_DEFINITION, l_OS_GetPressedKey);
@@ -6635,13 +6760,62 @@ void registerApis(lua_State* L) {
   Serial.println("[LUA] registerR3D ok"); Serial.flush();
 }
 
-// ===== Task Lua (Core 1) =====
-void taskLuaApp(void* arg) {
-  Serial.printf("== Lua Task Started at Core: %d ==\n", xPortGetCoreID());
-  Serial.printf("[LUA] stack high water will print after; free heap=%u psram=%u\n",
-                (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
-  Serial.flush();
+// ===== DESCARGA COMPLETA DO PROGRAMA =====
+// lua_close() destrói tudo que vive DENTRO da VM: variáveis, tabelas, closures, e (via __gc) Sprite, Font, Model3D com
+// todas as instâncias e arquivos abertos. Esta função limpa o que o programa deixou FORA da VM, no kernel, pro próximo
+// programa começar como depois de um boot. Roda na task Lua, DEPOIS do lua_close().
+static void programUnloadKernelState() {
+  // --- 3D: fila de modelos, buffers de cor presos / camada pendente e câmera ---
+  r3dQueueClear();
+  r3dResetLayers();
+  camera = Camera();
 
+  // --- Tela 2D: buffers de quadro pretos e todo o rastreio de retângulos sujos / diff de comandos zerado ---
+  // (o diff compara hashes de comandos, e o hash de Font usa o ponteiro dos dados: um Font novo pode cair no endereço
+  //  de um antigo; zerar o rastreio garante que nada do programa anterior seja reaproveitado)
+  if (gPresentMutex) xSemaphoreTake(gPresentMutex, portMAX_DELAY);
+  for (int i = 0; i < 2; ++i) {
+    LGFX_Sprite* b = frameBufs[i];
+    uint8_t* px = (uint8_t*)b->getBuffer();
+    if (px) memset(px, 0, (size_t)b->width() * (size_t)b->height() * 2);
+    bufDirty[i].n = 0;
+  }
+  frameDirtyAccum.n = 0;
+  frameDirtyPrev.n = 0;
+  gPendClear.n = 0;
+  gCmdN = 0; gCmdPrevN = 0;
+  gCmdOverflow = false;
+  gCmdPrevValid = false;
+  gClearedSinceUpdate = false;
+  gLayerPrevShown = 0;
+  gLastShownIdx = -1;
+  frameEverPushed = false;     // o 1º update do próximo programa manda a tela inteira
+  if (gPresentMutex) xSemaphoreGive(gPresentMutex);
+
+  // --- Teclado: configuração do programa anterior não vale pro próximo ---
+  kbDelayMs = KB_DEFAULT_DELAY_MS;
+  kbTimerStarted = false;
+  kbLastAcceptMs = 0;
+  kbLayer = 0;
+  kbCapsLock = false;
+
+  // Espera soltar as teclas: a que causou a troca (HOME, ENTER...) não pode vazar pro programa novo
+  bool m[KB_ROWS][KB_COLS];
+  const uint32_t t0 = millis();
+  while ((millis() - t0) < 1000) {
+    keyboardScanInto(m);
+    bool any = false;
+    for (int l = 0; l < KB_ROWS && !any; l++)
+      for (int c = 0; c < KB_COLS; c++) if (m[l][c]) { any = true; break; }
+    if (!any) break;
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+}
+
+// ===== Task Lua (Core 1) =====
+// Roda UM programa Lua numa VM própria. Retorna true se o programa pediu OS_StartProgram() (aí a task
+// destrói a VM e chama de novo com o novo caminho), false se a task deve terminar.
+static bool runLuaProgram(const char* scriptPath) {
   luaHeapUsed = 0;
 
   Serial.println("[LUA] lua_newstate..."); Serial.flush();
@@ -6649,42 +6823,35 @@ void taskLuaApp(void* arg) {
   if (!L) {
     Serial.println("ERR: Couldn't create LUA VM");
     Serial.flush();
-    vTaskDelete(NULL);
-    return;
+    return false;
   }
   Serial.println("[LUA] newstate ok"); Serial.flush();
 
-  Serial.println("[LUA] openlibs..."); Serial.flush();
   luaL_openlibs(L);
   lua_atpanic(L, r3d_lua_panic);
-  Serial.println("[LUA] openlibs ok"); Serial.flush();
 
   Serial.println("[LUA] registerApis..."); Serial.flush();
   registerApis(L);
   Serial.println("[LUA] registerApis ok"); Serial.flush();
 
-  const char* scriptPath = "/sys/src/sys.lua"; // /sys/src/sys.lua and /home/apps/3d_test/test_3d.lua
   Serial.printf("[LUA] opening %s\n", scriptPath); Serial.flush();
   File f = SD.open(scriptPath);
   if (!f) {
     Serial.printf("ERR: %s not found\n", scriptPath);
     Serial.flush();
     lua_close(L);
-    vTaskDelete(NULL);
-    return;
+    return false;
   }
 
   size_t size = f.size();
   Serial.printf("[LUA] script size=%u\n", (unsigned)size); Serial.flush();
   char* buffer = (char*)malloc(size + 1);
-
   if (!buffer) {
     Serial.println("ERR: No RAM available for script");
     Serial.flush();
     f.close();
     lua_close(L);
-    vTaskDelete(NULL);
-    return;
+    return false;
   }
 
   f.readBytes(buffer, size);
@@ -6697,24 +6864,71 @@ void taskLuaApp(void* arg) {
 
   // EXECUTA ANTES DE DAR FREE
   if (luaL_dostring(L, buffer) != LUA_OK) {
-    Serial.printf("LUA ERROR: %s\n", lua_tostring(L, -1));
-    Serial.flush();
+    if (!gNextProgramReq) {   // troca de programa também sai como "erro": não é falha de verdade
+      Serial.printf("LUA ERROR: %s\n", lua_tostring(L, -1));
+      Serial.flush();
+    }
   }
 
-
   luaTaskAlive = false;
+  gCurrentIsHome = false;
   free(buffer);
 
-  // LOOP
-  while (!luaRequestExit) {
+  // LOOP (programa terminou sozinho: a VM fica viva até alguém pedir exit ou trocar de programa)
+  while (!luaRequestExit && !gNextProgramReq) {
     vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 
+  const bool switching = gNextProgramReq;
+  lua_sethook(L, NULL, 0, 0);
   luaRequestExit = false;
-  lua_close(L);
 
-  Serial.println("[LUA] VM Shutdown");
-  vTaskDelete(NULL);
+  const uint32_t psramBefore = (uint32_t)ESP.getFreePsram();
+  const uint32_t heapBefore  = (uint32_t)ESP.getFreeHeap();
+
+  // Antes de destruir a VM: nada de modelo na fila 3D e nenhum quadro em voo usando os buffers
+  r3dQueueClear();
+  displayWaitIdle();
+
+  lua_close(L);                 // roda os __gc (Model3D, sprites, fontes...) e devolve a memória da VM
+  programUnloadKernelState();   // zera o que o programa deixou fora da VM (3D, tela, teclado)
+
+  Serial.printf("[LUA] VM Shutdown: lua heap residual=%u, psram %u -> %u, heap %u -> %u\n",
+                (unsigned)luaHeapUsed, (unsigned)psramBefore, (unsigned)ESP.getFreePsram(),
+                (unsigned)heapBefore, (unsigned)ESP.getFreeHeap());
+  if (luaHeapUsed != 0) Serial.println("[LUA] WARN: memoria da VM nao voltou a zero apos lua_close");
+  return switching;
+}
+
+void taskLuaApp(void* arg) {
+  Serial.printf("== Lua Task Started at Core: %d ==\n", xPortGetCoreID());
+  Serial.printf("[LUA] free heap=%u psram=%u\n", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+  Serial.flush();
+
+  static char path[LUA_PROGRAM_PATH_MAX];
+  snprintf(path, sizeof(path), "%s", HOME_PROGRAM_PATH);   // programa inicial
+
+  gNextProgramReq = false;
+  for (;;) {
+    gCurrentIsHome = (strcmp(path, HOME_PROGRAM_PATH) == 0);
+    const bool switching = runLuaProgram(path);
+    gCurrentIsHome = false;
+
+    if (!switching) {
+      // Programa terminou (endProgram) ou não conseguiu subir. A task NÃO morre: continua viva esperando um pedido
+      // (HOME), senão o kernel não teria como voltar pro sys.lua.
+      Serial.println("[LUA] no program running, waiting for HOME");
+      while (!gNextProgramReq) vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    // troca de programa: pega o novo caminho e sobe uma VM nova
+    portENTER_CRITICAL(&gProgMux);
+    strlcpy(path, gNextProgramPath, sizeof(path));
+    gNextProgramReq = false;
+    portEXIT_CRITICAL(&gProgMux);
+    Serial.printf("[LUA] starting program %s (free heap=%u psram=%u)\n",
+                  path, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+  }
 }
 
 // Boot
