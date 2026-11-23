@@ -173,6 +173,17 @@ struct MeshletBuild;    // defined later
 struct RzMesh;          // packed mesh header from .rzobj
 struct LuaModel3D;      // Lua userdata wrapper
 struct TexCell { int x0, y0; uint32_t e00, e10, e01, e11; };   // cache da célula 2x2 do filtro de textura (ver texel3c)
+// (no topo: o Arduino gera protótipos das funções FORCE_INLINE antes dos tipos definidos mais abaixo)
+// Hi-Z de UMA faixa (cada contexto de raster tem o seu: sem compartilhamento entre núcleos).
+// t[] guarda, por tile 8x8, o MENOR z já gravado (z = 1/w escalado; maior = mais perto). Como o z-buffer só cresce, um Hi-Z
+// velho continua conservador: nunca oclui algo visível. Tile com algum pixel ainda vazio tem mínimo 0 e nunca oclui.
+struct HiZ {
+  uint16_t* t;
+  int tw;              // tiles por linha
+  int y0, y1;          // faixa [y0,y1)
+  int since;           // meshlets desenhados desde a última reconstrução
+  bool valid;
+};
 
 
 // ===== KERNEL SERVICES (forward declarations) =====
@@ -4099,6 +4110,39 @@ static_assert(SPAN_N >= 1 && SPAN_N <= SPAN_FAR, "SPAN_N deve estar entre 1 e SP
 #ifndef PROMOTE_RESERVE
 #define PROMOTE_RESERVE (56 * 1024)   // internal RAM que SEMPRE sobra depois de promover texturas/arrays por quadro
 #endif
+// ---- otimizações de engine 3D: culling e oclusão (todas ligáveis/desligáveis em runtime: Render3D_SetOpt("hiz", false)) ----
+#ifndef OPT_MODEL_CULL
+#define OPT_MODEL_CULL 1    // descarta o MODELO inteiro se a AABB dele estiver fora do frustum (pula o laço de todos os meshlets)
+#endif
+#ifndef OPT_CONE
+#define OPT_CONE       1    // backface culling em BLOCO: cone de normais por meshlet (só modelos estáticos com culling ligado)
+#endif
+#ifndef OPT_HIZ
+#define OPT_HIZ        1    // Hi-Z por faixa: mínimo do z-buffer por tile 8x8, reconstruído no meio do quadro
+#endif
+#ifndef OPT_HIZ_TRI
+#define OPT_HIZ_TRI    1    // usa o Hi-Z também por TRIÂNGULO (antes de montar gradientes / rasterizar)
+#endif
+#ifndef OPT_HIZ_SPAN
+#define OPT_HIZ_SPAN   1    // usa o Hi-Z por LINHA: apara as pontas de cada span que caem em tiles ocluídos
+#endif
+#ifndef OPT_FAR_CULL
+#define OPT_FAR_CULL   0    // plano far (camera.farZ) por meshlet. DESLIGADO por padrão: um céu grande some se passar do far
+#endif
+#ifndef OPT_SMALL_CULL
+#define OPT_SMALL_CULL 0    // descarta meshlets cuja caixa projetada tem < SMALL_CULL_PX pixels (muda o visual: pode "piscar")
+#endif
+#ifndef SMALL_CULL_PX
+#define SMALL_CULL_PX  1.0f
+#endif
+#ifndef HIZ_REFRESH
+#define HIZ_REFRESH    16   // reconstrói o Hi-Z a cada N meshlets desenhados (e no começo de cada modelo)
+#endif
+#define HIZ_SHIFT      3    // tile de 8x8 pixels
+#define HIZ_MARGIN     3    // folga (em unidades de z de 16 bits) p/ erro de arredondamento de rcpf/interpolação: só oclui com certeza
+#ifndef R3D_PROFILE
+#define R3D_PROFILE 0
+#endif
 static_assert(ML_MAXV >= 3 && ML_MAXV <= 255, "ML_MAXV: índices locais são uint8_t");
 static_assert(ML_MAXT >= 1 && ML_MAXT <= 255, "ML_MAXT deve caber em uint8_t");
 
@@ -4147,9 +4191,23 @@ enum { CULL_NONE = 0, CULL_POS_AREA = 1, CULL_NEG_AREA = -1 };
 
 struct SV { float x, y, iw, u, v; };   // iw = 1/w (profundidade de view invertida); iw < 0 => atrás do near
 
+struct R3DOpt { bool modelCull, cone, hiz, hizTri, hizSpan, farCull, smallCull; };
+static R3DOpt gOpt = { OPT_MODEL_CULL != 0, OPT_CONE != 0, OPT_HIZ != 0, OPT_HIZ_TRI != 0, OPT_HIZ_SPAN != 0,
+                       OPT_FAR_CULL != 0, OPT_SMALL_CULL != 0 };
+// contadores (só com R3D_PROFILE 1). [0] núcleo da task Lua, [1] worker, [2] prepare() (serial)
+struct R3DStats { uint32_t ml, frustum, cone, model, hizMl, hizTri, hizBuild, drawn, small; };
+static R3DStats gStat[3];
+#if R3D_PROFILE
+#define R3D_STAT(p, f) ((p)->f++)
+#else
+#define R3D_STAT(p, f) ((void)0)
+#endif
+
 struct Target {
   int W, H;
   int y0, y1;          // faixa de linhas [y0,y1) que ESTE chamador pode escrever
+  HiZ* hz;             // Hi-Z desta faixa (nullptr = desligado)
+  R3DStats* st;        // contadores deste contexto
   uint16_t *color;     // RGB565, bytes já trocados (formato do painel)
   uint16_t *depth;     // 16 bits de 1/w escalado; 0 = infinito
   SV *sv;              // vértices projetados do meshlet atual (ML_MAXV entradas, internal RAM)
@@ -4206,6 +4264,8 @@ struct Meshlet {
   uint8_t  nv, nt;
   int16_t  tex;
   uint16_t flags;
+  int8_t   ca[3];          // eixo do cone de normais (x127), espaço do modelo
+  uint8_t  cc;             // corte do cone x255 (já com folga). 255 = sem cone utilizável (normais muito espalhadas)
 };
 struct TexData { uint16_t* data; int w, h; bool repeat; };
 
@@ -4684,6 +4744,9 @@ static void HOT rasterTri(const Target &T, int fi, int cull, const uint16_t* tda
   st.tex = tdata; st.tw = tw; st.th = th;
   st.zd = (uintptr_t)T.depth - (uintptr_t)T.color;
 
+  // Hi-Z por linha: apara as pontas do span que caem em tiles onde TODO pixel já é mais perto que o triângulo
+  const HiZ* const hz = (T.hz && gOpt.hizSpan && T.hz->valid) ? T.hz : nullptr;
+
   for (int y = yStart; y <= yEnd; ++y) {
     const float yc = (float)y + 0.5f;
     const float xa = xt + slopeL * (yc - yt);
@@ -4697,6 +4760,17 @@ static void HOT rasterTri(const Target &T, int fi, int cull, const uint16_t* tda
     if (xe > W - 1) xe = W - 1;
     if (xe < xs) continue;
 
+    if (hz) {
+      // 1/w é linear na linha: o máximo do z do span está numa das pontas
+      const float iwA = i0 + diwdx * (((float)xs + 0.5f) - x0) + diwdy * (yc - y0);
+      const float iwB = iwA + diwdx * (float)(xe - xs);
+      const int zt = (int)((iwA > iwB ? iwA : iwB) * T.depthScale) + HIZ_MARGIN;
+      const uint16_t* hrow = hz->t + (size_t)((y - hz->y0) >> HIZ_SHIFT) * hz->tw;
+      while (xs <= xe && (int)hrow[xs >> HIZ_SHIFT] > zt) xs = ((xs >> HIZ_SHIFT) + 1) << HIZ_SHIFT;
+      while (xe >= xs && (int)hrow[xe >> HIZ_SHIFT] > zt) xe = ((xe >> HIZ_SHIFT) << HIZ_SHIFT) - 1;
+      if (xe < xs) continue;
+    }
+
     const float fx = ((float)xs + 0.5f) - x0;
     const float fy = yc - y0;
     fn(T.color + y * W, xs | (xe << 16),
@@ -4704,6 +4778,89 @@ static void HOT rasterTri(const Target &T, int fi, int cull, const uint16_t* tda
        uw0 + duwdx*fx + duwdy*fy,
        vw0 + dvwdx*fx + dvwdy*fy, &st);
   }
+}
+
+// ---- Hi-Z (oclusão por tile) ----
+// Reconstrói o mínimo de z por tile 8x8 das linhas da faixa deste contexto (só lê o z-buffer da PRÓPRIA faixa).
+// Tile que já tem um pixel vazio (0) fica em 0 e pula o resto: no começo do quadro quase tudo é 0 e a varredura é barata.
+static void HOT hizBuild(const Target& T, HiZ& h) {
+  const int W = T.W, tw = h.tw;
+  const int trows = ((h.y1 - h.y0) + (1 << HIZ_SHIFT) - 1) >> HIZ_SHIFT;
+  for (int ty = 0; ty < trows; ++ty) {
+    uint16_t* o = h.t + (size_t)ty * tw;
+    for (int i = 0; i < tw; ++i) o[i] = 0xFFFF;
+    const int ya = h.y0 + (ty << HIZ_SHIFT);
+    const int yb = (ya + 8 < h.y1) ? ya + 8 : h.y1;
+    for (int y = ya; y < yb; ++y) {
+      const uint16_t* z = T.depth + (size_t)y * W;
+      for (int tx = 0; tx < tw; ++tx) {
+        uint32_t m = o[tx];
+        if (!m) continue;
+        const int xa = tx << HIZ_SHIFT;
+        if (xa + 8 <= W) {                                   // tile inteiro: 4 leituras de 32 bits (xa múltiplo de 8, W par => alinhado)
+          const uint32_t* z32 = (const uint32_t*)(z + xa);
+          for (int k = 0; k < 4; ++k) {
+            const uint32_t v = z32[k];
+            const uint32_t lo = v & 0xFFFFu, hi = v >> 16;
+            if (lo < m) m = lo;
+            if (hi < m) m = hi;
+          }
+        } else {
+          for (int x = xa; x < W; ++x) if (z[x] < m) m = z[x];
+        }
+        o[tx] = (uint16_t)m;
+      }
+    }
+  }
+  h.since = 0;
+  h.valid = true;
+}
+
+// true => TODOS os pixels do retângulo [minx,maxx]x[miny,maxy] já têm z > zmax, ou seja, nada que tenha z <= zmax passa no z-test.
+// zmax = z do ponto mais PERTO do que se quer desenhar (+ HIZ_MARGIN). Retângulo em coordenadas de pixel; ±1 pixel de folga.
+FORCE_INLINE bool hizHidden(const HiZ& h, int W, float minx, float maxx, float miny, float maxy, int zmax) {
+  float x0 = minx - 1.0f, x1 = maxx + 1.0f, y0 = miny - 1.0f, y1 = maxy + 1.0f;
+  if (x0 < 0.0f) x0 = 0.0f;
+  if (x1 > (float)(W - 1)) x1 = (float)(W - 1);
+  if (y0 < (float)h.y0) y0 = (float)h.y0;
+  if (y1 > (float)(h.y1 - 1)) y1 = (float)(h.y1 - 1);
+  if (!(x1 >= x0) || !(y1 >= y0)) return false;              // (também pega NaN) fora da tela/faixa: deixa o resto decidir
+  const int tx0 = (int)x0 >> HIZ_SHIFT, tx1 = (int)x1 >> HIZ_SHIFT;
+  const int ty0 = ((int)y0 - h.y0) >> HIZ_SHIFT, ty1 = ((int)y1 - h.y0) >> HIZ_SHIFT;
+  for (int ty = ty0; ty <= ty1; ++ty) {
+    const uint16_t* row = h.t + (size_t)ty * h.tw;
+    for (int tx = tx0; tx <= tx1; ++tx) if ((int)row[tx] <= zmax) return false;
+  }
+  return true;
+}
+
+// Retângulo de tela e menor w da AABB de um meshlet que está INTEIRO na frente do near (vflag == 2).
+// Linhas X, Y, W do MVP aplicadas ao centro + desvios por eixo; 8 cantos.
+FORCE_INLINE bool boxRect(const float (*M)[4], const float* bcx, const float* bhx, float fW, float fH,
+                          float& minx, float& maxx, float& miny, float& maxy, float& wmin) {
+  float bw[3], dx[3][3];          // [linha 0=X,1=Y,2=W] base e desvio por eixo
+  const int rows[3] = { 0, 1, 3 };
+  for (int r = 0; r < 3; ++r) {
+    const float* m = M[rows[r]];
+    bw[r] = m[0]*bcx[0] + m[1]*bcx[1] + m[2]*bcx[2] + m[3];
+    dx[r][0] = m[0]*bhx[0]; dx[r][1] = m[1]*bhx[1]; dx[r][2] = m[2]*bhx[2];
+  }
+  wmin = bw[2] - fabsf(dx[2][0]) - fabsf(dx[2][1]) - fabsf(dx[2][2]);
+  if (wmin < 1e-4f) return false;
+  minx = miny = 1e30f; maxx = maxy = -1e30f;
+  for (int i = 0; i < 8; ++i) {
+    const float a = (i & 1) ? 1.0f : -1.0f, b = (i & 2) ? 1.0f : -1.0f, c = (i & 4) ? 1.0f : -1.0f;
+    const float w  = bw[2] + a*dx[2][0] + b*dx[2][1] + c*dx[2][2];
+    const float cx = bw[0] + a*dx[0][0] + b*dx[0][1] + c*dx[0][2];
+    const float cy = bw[1] + a*dx[1][0] + b*dx[1][1] + c*dx[1][2];
+    const float inv = rcpf(w > 1e-4f ? w : 1e-4f);
+    const float x = (cx * inv * 0.5f + 0.5f) * fW, y = (0.5f - cy * inv * 0.5f) * fH;
+    if (x < minx) minx = x;
+    if (x > maxx) maxx = x;
+    if (y < miny) miny = y;
+    if (y > maxy) maxy = y;
+  }
+  return true;
 }
 
 // ---- construtor de meshlets (roda no load, 2 passadas: 1ª conta, 2ª grava) ----
@@ -4728,6 +4885,43 @@ static void mbFlush(MeshletBuild& b) {
     for (int a = 0; a < 3; ++a) { m.c[a] = 0.5f * (mn[a] + mx[a]); m.h[a] = 0.5f * (mx[a] - mn[a]); }
     m.vOff = b.nV; m.tOff = b.nT; m.nv = (uint8_t)b.nu; m.nt = (uint8_t)b.nt;
     m.tex = (int16_t)b.tex; m.flags = b.flags;
+
+    // ---- cone de normais (backface culling em bloco; ver Model::prepare) ----
+    // eixo = média das normais unitárias de face (enrolamento (B-A)x(C-A), o mesmo do rasterizador); corte = sin(ângulo máx.)
+    // medido contra o eixo JÁ quantizado em int8, arredondado p/ cima e com 1% de folga (o teste em prepare usa o eixo quantizado)
+    m.ca[0] = m.ca[1] = m.ca[2] = 0; m.cc = 255;
+    {
+      float nx[ML_MAXT], ny[ML_MAXT], nz[ML_MAXT];
+      int nn = 0;
+      float sx = 0.0f, sy = 0.0f, sz = 0.0f;
+      for (uint32_t t = 0; t < b.nt; ++t) {
+        const Vtx& p0 = out[b.ltri[3 * t]]; const Vtx& p1 = out[b.ltri[3 * t + 1]]; const Vtx& p2 = out[b.ltri[3 * t + 2]];
+        const float ex = p1.x - p0.x, ey = p1.y - p0.y, ez = p1.z - p0.z;
+        const float fx = p2.x - p0.x, fy = p2.y - p0.y, fz = p2.z - p0.z;
+        float cx = ey * fz - ez * fy, cy = ez * fx - ex * fz, cz = ex * fy - ey * fx;
+        const float l2 = cx * cx + cy * cy + cz * cz;
+        if (l2 < 1e-20f) continue;                         // degenerado: o rasterizador também descarta
+        const float il = 1.0f / sqrtf(l2);
+        cx *= il; cy *= il; cz *= il;
+        nx[nn] = cx; ny[nn] = cy; nz[nn] = cz; ++nn;
+        sx += cx; sy += cy; sz += cz;
+      }
+      const float sl = sqrtf(sx * sx + sy * sy + sz * sz);
+      if (nn > 0 && sl > 1e-4f) {
+        int q[3] = { (int)lroundf(sx / sl * 127.0f), (int)lroundf(sy / sl * 127.0f), (int)lroundf(sz / sl * 127.0f) };
+        const float ql = sqrtf((float)(q[0] * q[0] + q[1] * q[1] + q[2] * q[2]));
+        if (ql > 100.0f) {
+          const float ax = q[0] / ql, ay = q[1] / ql, az = q[2] / ql;     // eixo unitário realmente armazenado
+          float mindp = 1.0f;
+          for (int i = 0; i < nn; ++i) { const float d = nx[i] * ax + ny[i] * ay + nz[i] * az; if (d < mindp) mindp = d; }
+          if (mindp > 0.1f) {
+            const float cut = sqrtf(fmaxf(0.0f, 1.0f - mindp * mindp)) * 1.01f;   // 1,01: |eixo int8| pode passar de 127 em ~0,8%
+            const int cq = (int)ceilf(cut * 255.0f);
+            if (cq < 255) { m.ca[0] = (int8_t)q[0]; m.ca[1] = (int8_t)q[1]; m.ca[2] = (int8_t)q[2]; m.cc = (uint8_t)cq; }
+          }
+        }
+      }
+    }
     memcpy(b.tp + 3 * (size_t)b.nT, b.ltri, 3 * (size_t)b.nt);
   }
   for (uint32_t i = 0; i < b.nu; ++i) b.map[b.used[i]] = 0xFFFF;
@@ -4788,6 +4982,8 @@ struct Model {
   uint8_t* vflag;          // por meshlet, neste quadro: 0 = fora do frustum, 1 = dentro, 2 = dentro e todo na frente do near
   uint16_t* vis;           // meshlets visíveis no frustum, na ordem de desenho; bit15 = "inteiro na frente do near"
   int visCount;
+  float bc[3] = {0, 0, 0}, bh[3] = {0, 0, 0};   // AABB do modelo inteiro (centro / meia-extensão), união das AABBs dos meshlets
+  bool boundsDirty = true;                      // recalcular bc/bh (load, e a cada pose nova em modelos skinned)
 
   // ---- skinning / animação (só usados se o .rzobj for v4 com esqueleto) ----
   Vtx*      vdraw = nullptr;     // vértices que o draw() lê: vpool (modelo estático) ou vskin (skinned)
@@ -4840,6 +5036,7 @@ struct Model {
     if (isClone) { unloadClone(); return; }
     visCount = 0;                      // 1º: qualquer draw/prepare passa a sair cedo
     mlCount = 0;
+    boundsDirty = true;
     if (texs) {
       for (int i = 0; i < texCount; ++i) if (texs[i].data) heap_caps_free(texs[i].data);
       heap_caps_free(texs);
@@ -4896,6 +5093,7 @@ struct Model {
   bool cloneFrom(const Model& s) {
     if (!s.loaded() || s.isClone) return false;
     isClone = true;
+    boundsDirty = true;
     vertCount = s.vertCount; triCount = s.triCount; cull = s.cull;
     vpool = s.vpool; tpool = s.tpool; mlCount = s.mlCount; poolV = s.poolV;
     texs = s.texs; texCount = s.texCount;
@@ -5309,6 +5507,22 @@ struct Model {
       }
       for (int a = 0; a < 3; ++a) { s.c[a] = 0.5f * (mn[a] + mx[a]); s.h[a] = 0.5f * (mx[a] - mn[a]); }
     }
+    boundsDirty = true;      // as AABBs dos meshlets mudaram => a AABB do modelo também
+  }
+
+  // AABB do modelo = união das AABBs dos meshlets (1 passada pelos cabeçalhos; só roda de novo se a pose mudou)
+  void computeBounds() {
+    float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+    for (int i = 0; i < mlCount; ++i) {
+      const Meshlet& s = ml[i];
+      for (int a = 0; a < 3; ++a) {
+        const float lo = s.c[a] - s.h[a], hi = s.c[a] + s.h[a];
+        if (lo < mn[a]) mn[a] = lo;
+        if (hi > mx[a]) mx[a] = hi;
+      }
+    }
+    for (int a = 0; a < 3; ++a) { bc[a] = 0.5f * (mn[a] + mx[a]); bh[a] = 0.5f * (mx[a] - mn[a]); }
+    boundsDirty = false;
   }
 
   void applyPose() { buildPose(); skinVertices(); }
@@ -5335,11 +5549,17 @@ struct Model {
   // Os cabeçalhos (PSRAM) são lidos UMA vez, em sequência; o sort e a montagem de `vis` só mexem em arrays pequenos
   // (internal RAM, veja promoteFrameData). Insertion sort sobre a ordem do quadro anterior (~O(n)); com orçamento
   // de deslocamentos: se estourar (câmera "teleportou"), cai num std::sort.
-  void prepare(const Mat4 &MVP, float nearW) {
+  // Extras (todos com chave em gOpt):
+  //  - cull do MODELO: AABB do modelo contra o frustum antes de olhar qualquer meshlet;
+  //  - far: descarta meshlet além de farW (farW <= 0 ou gOpt.farCull = false desliga);
+  //  - cone de normais: se TODAS as faces do meshlet viram as costas p/ a câmera, o meshlet inteiro some (não projeta nem 1 vértice).
+  void prepare(const Mat4 &MVP, float nearW, float farW = 0.0f) {
     visCount = 0;
     if (mlCount <= 0 || !vis || !vflag) return;
     const float (*M)[4] = MVP.m;
     const bool doSort = (ML_SORT != 0) && order && skey && mlCount > 1;
+    R3DStats* const sp = &gStat[2];
+    (void)sp;
 
     // planos do frustum no formato p·(x,y,z,1) >= 0 (= dentro): esq, dir, baixo, cima, near
     float P[5][4], A[5][3];
@@ -5353,10 +5573,55 @@ struct Model {
     P[4][3] -= nearW;
     for (int p = 0; p < 5; ++p) for (int k = 0; k < 3; ++k) A[p][k] = fabsf(P[p][k]);
 
+    const bool farOn = gOpt.farCull && farW > 0.0f;
+    const float aw0 = fabsf(M[3][0]), aw1 = fabsf(M[3][1]), aw2 = fabsf(M[3][2]);
+
+    // ---- cull do modelo inteiro ----
+    if (gOpt.modelCull) {
+      if (boundsDirty) computeBounds();
+      bool out = false;
+      for (int p = 0; p < 5 && !out; ++p) {
+        const float d = P[p][0]*bc[0] + P[p][1]*bc[1] + P[p][2]*bc[2] + P[p][3];
+        const float e = A[p][0]*bh[0] + A[p][1]*bh[1] + A[p][2]*bh[2];
+        if (d + e < 0.0f) out = true;
+      }
+      if (!out && farOn) {
+        const float wc = M[3][0]*bc[0] + M[3][1]*bc[1] + M[3][2]*bc[2] + M[3][3];
+        if (farW - wc + (aw0*bh[0] + aw1*bh[1] + aw2*bh[2]) < 0.0f) out = true;
+      }
+      if (out) { R3D_STAT(sp, model); return; }
+    }
+
+    // ---- backface em bloco: posição da câmera no espaço do modelo, a partir do MVP ----
+    // A câmera é o ponto que o MVP manda p/ x=y=w=0: vetor nulo das linhas X, Y, W (cofactores). O sinal de e[3] carrega a
+    // "mão" da projeção (inclui escala negativa/espelho no modelo): área de tela > 0  <=>  sign(e3) * n·(A - câmera) > 0
+    // (n = (B-A)x(C-A), A = vértice do triângulo). Verificado numericamente (20 mil triângulos/câmeras/modelos aleatórios).
+    bool coneOn = gOpt.cone && boneCount == 0 && cull != CULL_NONE;
+    float eye[3] = { 0, 0, 0 }, coneSgn = 0.0f;
+    if (coneOn) {
+      const float* X = M[0]; const float* Y = M[1]; const float* W = M[3];
+      #define DET3(a0,a1,a2,b0,b1,b2,c0,c1,c2) ((a0)*((b1)*(c2)-(b2)*(c1)) - (a1)*((b0)*(c2)-(b2)*(c0)) + (a2)*((b0)*(c1)-(b1)*(c0)))
+      const float e0 =  DET3(X[1],X[2],X[3], Y[1],Y[2],Y[3], W[1],W[2],W[3]);
+      const float e1 = -DET3(X[0],X[2],X[3], Y[0],Y[2],Y[3], W[0],W[2],W[3]);
+      const float e2 =  DET3(X[0],X[1],X[3], Y[0],Y[1],Y[3], W[0],W[1],W[3]);
+      const float e3 = -DET3(X[0],X[1],X[2], Y[0],Y[1],Y[2], W[0],W[1],W[2]);
+      #undef DET3
+      if (fabsf(e3) < 1e-12f) {
+        coneOn = false;
+      } else {
+        const float ie = 1.0f / e3;
+        eye[0] = e0 * ie; eye[1] = e1 * ie; eye[2] = e2 * ie;
+        const float q = (e3 > 0.0f) ? 1.0f : -1.0f;
+        // culled <=> (modo POS: q*t > 0 ; modo NEG: q*t < 0), t = n·(A - câmera). O cone testa "t tem o sinal coneSgn p/ todas as faces"
+        coneSgn = ((cull == CULL_POS_AREA) ? q : -q) * (1.0f / 127.0f);
+      }
+    }
+
     // passe sequencial: chave de profundidade + teste de frustum de cada meshlet
     for (int i = 0; i < mlCount; ++i) {
       const Meshlet &s = ml[i];
       if (doSort) skey[i] = M[3][0]*s.c[0] + M[3][1]*s.c[1] + M[3][2]*s.c[2] + M[3][3];   // w = profundidade de view
+      R3D_STAT(sp, ml);
       // AABB fora de um plano <=> o MAIOR valor de p·X na caixa é < 0 (= os 8 cantos fora do mesmo plano)
       uint8_t f = 1;
       float dN = 0.0f, eN = 0.0f;
@@ -5366,7 +5631,21 @@ struct Model {
         if (d + e < 0.0f) { f = 0; break; }
         dN = d; eN = e;                         // no último passo (p=4) são os valores do plano near
       }
-      if (f && (dN - eN) >= 0.0f) f = 2;        // MENOR w na caixa >= near: a projeção da caixa é confiável
+      if (!f) { R3D_STAT(sp, frustum); vflag[i] = 0; continue; }
+      if (farOn) {
+        const float wc = M[3][0]*s.c[0] + M[3][1]*s.c[1] + M[3][2]*s.c[2] + M[3][3];
+        if (farW - wc + (aw0*s.h[0] + aw1*s.h[1] + aw2*s.h[2]) < 0.0f) { R3D_STAT(sp, frustum); vflag[i] = 0; continue; }
+      }
+      if (coneOn && s.cc < 255 && !(s.flags & RZM_DOUBLE)) {
+        // todas as faces de costas <=> dot(v, eixo) >= corte*|v| + raio   (v = centro - câmera; raio = soma das meias-extensões, >= esfera)
+        const float vx = s.c[0] - eye[0], vy = s.c[1] - eye[1], vz = s.c[2] - eye[2];
+        const float D = (vx*(float)s.ca[0] + vy*(float)s.ca[1] + vz*(float)s.ca[2]) * coneSgn - (s.h[0] + s.h[1] + s.h[2]) * 1.01f;
+        if (D > 0.0f) {
+          const float cut = (float)s.cc * (1.0f / 255.0f);
+          if (D * D > cut * cut * (vx*vx + vy*vy + vz*vz)) { R3D_STAT(sp, cone); vflag[i] = 0; continue; }
+        }
+      }
+      if ((dN - eN) >= 0.0f) f = 2;             // MENOR w na caixa >= near: a projeção da caixa é confiável
       vflag[i] = f;
     }
 
@@ -5470,6 +5749,14 @@ void HOT Model::draw(const Mat4 &MVP, const Target &T) const
     const float apa0 = fabsf(pa[0]), apa1 = fabsf(pa[1]), apa2 = fabsf(pa[2]);
     const float apb0 = fabsf(pb[0]), apb1 = fabsf(pb[1]), apb2 = fabsf(pb[2]);
 
+    // Hi-Z: o que modelos anteriores (e os meshlets mais perto deste) já gravaram na faixa vira oclusor
+    HiZ* const hzs = T.hz;
+    R3DStats* const st = T.st;
+    (void)st;
+    const bool hizTri = hzs && gOpt.hizTri;
+    const bool smallOn = gOpt.smallCull;
+    if (hzs && hzs->since > 0) { hizBuild(T, *hzs); R3D_STAT(st, hizBuild); }
+
     for (int vi = 0; vi < visCount; ++vi) {
       const uint16_t e = vis[vi];
       const Meshlet &s = ml[e & 0x7FFF];
@@ -5482,6 +5769,21 @@ void HOT Model::draw(const Mat4 &MVP, const Target &T) const
         const float db = pb[0]*cx + pb[1]*cy + pb[2]*cz + pb[3];
         if (db + (apb0*hx + apb1*hy + apb2*hz) <= 0.0f) continue;    // tudo abaixo
       }
+
+      // ---- oclusão do meshlet inteiro (Hi-Z) / meshlet minúsculo ----
+      if (hzs && hzs->since >= HIZ_REFRESH) { hizBuild(T, *hzs); R3D_STAT(st, hizBuild); }
+      if ((e & 0x8000) && ((hzs && hzs->valid) || smallOn)) {
+        float rx0, rx1, ry0, ry1, wmin;
+        if (boxRect(M, s.c, s.h, fW, fH, rx0, rx1, ry0, ry1, wmin)) {
+          if (smallOn && (rx1 - rx0) < SMALL_CULL_PX && (ry1 - ry0) < SMALL_CULL_PX) { R3D_STAT(st, small); continue; }
+          if (hzs && hzs->valid) {
+            const int zmax = (int)(rcpf(wmin) * T.depthScale) + HIZ_MARGIN;   // z do ponto mais perto da caixa
+            if (hizHidden(*hzs, T.W, rx0, rx1, ry0, ry1, zmax)) { R3D_STAT(st, hizMl); continue; }
+          }
+        }
+      }
+      if (hzs) hzs->since++;
+      R3D_STAT(st, drawn);
 
       const Vtx* vb = vdraw + s.vOff;
       const uint8_t* tp = tpool + 3 * (size_t)s.tOff;
@@ -5536,6 +5838,16 @@ void HOT Model::draw(const Mat4 &MVP, const Target &T) const
             const float area = (B.x - A.x) * (C.y - A.y) - (C.x - A.x) * (B.y - A.y);
             if (cullMode == CULL_POS_AREA && area > 0.0f) continue;
             if (cullMode == CULL_NEG_AREA && area < 0.0f) continue;
+          }
+          if (hizTri && hzs->valid) {
+            // Hi-Z por triângulo: se o ponto MAIS PERTO dele (maior 1/w) já está atrás de tudo que cobre os tiles dele, nem monta gradientes.
+            // Só vale p/ triângulos pequenos: num grande o teste raramente fecha e o rasterTri já apara os spans por linha.
+            const float mnx = min3f(A.x, B.x, C.x), mxx = max3f(A.x, B.x, C.x);
+            const float mny = min3f(A.y, B.y, C.y), mxy = max3f(A.y, B.y, C.y);
+            if ((mxx - mnx) < 32.0f && (mxy - mny) < 32.0f) {
+              const int zt = (int)(max3f(A.iw, B.iw, C.iw) * T.depthScale) + HIZ_MARGIN;
+              if (hizHidden(*hzs, T.W, mnx, mxx, mny, mxy, zt)) { R3D_STAT(st, hizTri); continue; }
+            }
           }
           rasterTri(T, fi, CULL_NONE, tdata, tw, th, A, B, C);   // o culling por área já foi feito logo acima
           continue;
@@ -5651,6 +5963,9 @@ static uint16_t *dmaBuf[2] = {nullptr, nullptr};
 // scratch de projeção de UM meshlet por contexto de raster (0 = núcleo do loop, 1 = worker): internal RAM estática
 static SV      gSV[2][ML_MAXV];
 static uint8_t gOC[2][ML_MAXV];
+// Hi-Z por contexto de raster (0 = núcleo do loop, 1 = worker): cabeçalho + tiles (alocados em r3dInit, pequenos)
+static HiZ      gHiz[2];
+static uint16_t* gHizMem[2] = {nullptr, nullptr};
 
 static QueueHandle_t freeQ, fullQ;
 
@@ -5709,6 +6024,14 @@ static void renderBands(int ctx) {
     T.sv = gSV[ctx]; T.oc = gOC[ctx];
     T.nearW = gJob.nearW;
     T.depthScale = gJob.depthScale;
+    T.st = &gStat[ctx];
+    T.hz = nullptr;
+    if (gOpt.hiz && gHizMem[ctx]) {       // Hi-Z desta faixa: começa inválido (z-buffer vazio) e só passa a valer depois de ter oclusores
+      HiZ& H = gHiz[ctx];
+      H.t = gHizMem[ctx]; H.tw = (HR_W + (1 << HIZ_SHIFT) - 1) >> HIZ_SHIFT;
+      H.y0 = T.y0; H.y1 = T.y1; H.since = 0; H.valid = false;
+      T.hz = &H;
+    }
 
     // limpa só as linhas desta faixa: cor preta e profundidade 0 (= infinito, pois guardamos 1/w)
     const size_t off = (size_t)T.y0 * HR_W, cnt = (size_t)(T.y1 - T.y0) * HR_W;
@@ -5909,6 +6232,7 @@ static void r3dFreeBuffers() {
   if (colorBuf[1] && colorBuf[1] != colorBuf[0]) heap_caps_free(colorBuf[1]);
   if (colorBuf[0]) heap_caps_free(colorBuf[0]);
   if (zBuf)        heap_caps_free(zBuf);
+  for (int i = 0; i < 2; ++i) { if (gHizMem[i]) heap_caps_free(gHizMem[i]); gHizMem[i] = nullptr; }
   colorBuf[0] = colorBuf[1] = nullptr;
   zBuf = nullptr;
   if (gR3DOwnDma) {
@@ -5959,6 +6283,12 @@ static bool r3dInit(int renderDiv, bool dualCore) {
   colorBuf[0] = (uint16_t*)r3dAllocBuf(total * 2, "r3d color A", R3D_COLORA_RESERVE);
   colorBuf[1] = (uint16_t*)r3dAllocBuf(total * 2, "r3d color B", R3D_INTERNAL_RESERVE);   // 2o quadro: permite o blit assíncrono
   if (!colorBuf[1]) colorBuf[1] = colorBuf[0];   // sem memória: cai no caminho síncrono (1 buffer)
+  {   // Hi-Z: 1 mínimo de z (16 bits) por tile 8x8; no pior caso (1 faixa = quadro inteiro) ~1,3 KB por contexto. Sem memória => Hi-Z desligado
+    const size_t hizBytes = (size_t)((HR_W + 7) >> HIZ_SHIFT) * (size_t)(((HR_H + 7) >> HIZ_SHIFT) + 1) * 2;
+    for (int i = 0; i < 2; ++i) gHizMem[i] = (uint16_t*)heap_caps_malloc(hizBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    Serial.printf("  %-14s %7u B x2 -> %s\n", "r3d hi-z", (unsigned)hizBytes, (gHizMem[0] && gHizMem[1]) ? "internal RAM" : "FALHOU (Hi-Z off)");
+    if (!gHizMem[0] || !gHizMem[1]) { for (int i = 0; i < 2; ++i) { if (gHizMem[i]) heap_caps_free(gHizMem[i]); gHizMem[i] = nullptr; } }
+  }
   if (!zBuf || !colorBuf[0] || !dmaBuf[0] || !dmaBuf[1]) {
     Serial.println("[R3D] buffer alloc FAILED");
     errf("r3dInit: buffer alloc failed");
@@ -6056,7 +6386,7 @@ static void r3dRenderTo(uint16_t* color) {
 #if R3D_PROFILE
   const int64_t tPrep0 = esp_timer_get_time();
 #endif
-  for (int i = 0; i < n; ++i) gJob.model[i]->prepare(gJob.mvp[i], camera.nearZ);
+  for (int i = 0; i < n; ++i) gJob.model[i]->prepare(gJob.mvp[i], camera.nearZ, camera.farZ);
 #if R3D_PROFILE
   gProfPrepUs += (uint32_t)(esp_timer_get_time() - tPrep0);
 #endif
@@ -6748,6 +7078,18 @@ int l_Render3D(lua_State* L) {
       Serial.printf("[R3D PROF] %.1f fps | por quadro: lua %.2f ms, espera SPI %.2f ms, raster %.2f ms (prepare %.2f) | worker fez %.0f%% das faixas\n",
                     n * 1e6 / (double)(pC - pT0), pAcc[0] / n / 1000.0, pAcc[1] / n / 1000.0, pAcc[2] / n / 1000.0,
                     (double)gProfPrepUs / n / 1000.0, bw > 0 ? 100.0 * gProfBands[1].load() / bw : 0.0);
+      {
+        R3DStats a = {};
+        for (int i = 0; i < 3; ++i) {
+          a.ml += gStat[i].ml; a.frustum += gStat[i].frustum; a.cone += gStat[i].cone; a.model += gStat[i].model;
+          a.hizMl += gStat[i].hizMl; a.hizTri += gStat[i].hizTri; a.hizBuild += gStat[i].hizBuild;
+          a.drawn += gStat[i].drawn; a.small += gStat[i].small;
+        }
+        // "meshlets" = candidatos no prepare (1x por quadro); "desenhados" e "hiz" contam 1x por faixa (RENDER_BANDS faixas)
+        Serial.printf("[R3D OPT] por quadro: meshlets %.0f | modelo fora %.2f | frustum %.0f | cone %.0f | meshlet-faixas desenhados %.0f, hiz %.0f, pequenos %.0f | tri hiz %.0f | hiz builds %.0f\n",
+                      a.ml / n, a.model / n, a.frustum / n, a.cone / n, a.drawn / n, a.hizMl / n, a.small / n, a.hizTri / n, a.hizBuild / n);
+        memset(gStat, 0, sizeof(gStat));
+      }
       pAcc[0] = pAcc[1] = pAcc[2] = pAcc[3] = 0; pT0 = pC; gProfPrepUs = 0;
       gProfBands[0] = 0; gProfBands[1] = 0;
     }
@@ -6844,6 +7186,27 @@ static int r3d_lua_panic(lua_State* L) {
   return 0; // lua still aborts after this returns in some builds; we also abort explicitly
 }
 
+// Render3D_SetOpt(nome, ligado) -> valor anterior. Liga/desliga as otimizações em runtime (p/ comparar FPS e checar a imagem):
+//   "modelcull" AABB do modelo inteiro | "cone" backface em bloco | "hiz" oclusão por tile | "hiztri" Hi-Z por triângulo
+//   "hizspan" Hi-Z por linha | "farcull" plano far (cuidado com céu grande) | "smallcull" meshlets < 1 px (muda o visual)
+// Render3D_SetOpt(nome) sem 2º argumento só consulta.
+int l_Render3DSetOpt(lua_State* L) {
+  const char* n = luaL_checkstring(L, 1);
+  bool* p = nullptr;
+  if      (!strcmp(n, "modelcull")) p = &gOpt.modelCull;
+  else if (!strcmp(n, "cone"))      p = &gOpt.cone;
+  else if (!strcmp(n, "hiz"))       p = &gOpt.hiz;
+  else if (!strcmp(n, "hiztri"))    p = &gOpt.hizTri;
+  else if (!strcmp(n, "hizspan"))   p = &gOpt.hizSpan;
+  else if (!strcmp(n, "farcull"))   p = &gOpt.farCull;
+  else if (!strcmp(n, "smallcull")) p = &gOpt.smallCull;
+  else return luaL_error(L, "unknown option '%s' (modelcull, cone, hiz, hiztri, hizspan, farcull, smallcull)", n);
+  const bool old = *p;
+  if (!lua_isnoneornil(L, 2)) *p = lua_toboolean(L, 2) != 0;
+  lua_pushboolean(L, old);
+  return 1;
+}
+
 void registerR3D(lua_State* L) {
   Serial.println("[R3D] registering Model3D"); Serial.flush();
   registerModel3D(L);
@@ -6852,6 +7215,7 @@ void registerR3D(lua_State* L) {
   lua_register(L, "Init3DRenderer", l_Init3DRenderer);
   lua_register(L, "Begin3DFrame", l_Begin3DFrame);
   lua_register(L, "Render3D", l_Render3D);
+  lua_register(L, "Render3D_SetOpt", l_Render3DSetOpt);
   lua_register(L, "Composite3DToFrame", l_Composite3DToFrame);
 
   lua_register(L, "Camera3D_SetPosition", l_Camera3D_setPosition);
