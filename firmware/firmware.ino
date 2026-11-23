@@ -4014,7 +4014,7 @@ void registerFont(lua_State* L){
 #define SPAN_N        16    // a cada N pixels a textura é corrigida em perspectiva (menor = mais exato, mais lento)
 #define SPAN_FAR      32    // trecho maior, usado quando 1/w varia pouco no trecho (superfícies distantes/frontais)
 static_assert(SPAN_N >= 1 && SPAN_N <= SPAN_FAR, "SPAN_N deve estar entre 1 e SPAN_FAR");
-#define RENDER_DUALCORE 1   // 1 = raster dividido entre os 2 núcleos (faixas horizontais); 0 = só o núcleo do loop()
+#define RENDER_DUALCORE 0   // 1 = raster dividido entre os 2 núcleos (faixas horizontais); 0 = só o núcleo do loop()
 #define RENDER_BANDS  6     // nº de faixas horizontais por quadro (distribuídas dinamicamente entre os núcleos)
                             // (com meshlets a duplicação de projeção por faixa é pequena: mais faixas = melhor balanço)
 
@@ -4072,17 +4072,11 @@ static_assert(ML_MAXT >= 1 && ML_MAXT <= 255, "ML_MAXT deve caber em uint8_t");
 #define MAX_CLIPS     32    // clipes de animação por modelo
 #endif
 
-// ---- cenário Kokiri (kokiri.rzobj é uma CENA inteira, não um skybox) ----
-// ---- câmera orbital (independente de FPS: velocidades em unidades POR SEGUNDO, multiplicadas por dt) ----
+// ---- câmera orbital
 #define ORBIT_SPEED   1.0f    // rad/s  (1.0 => volta completa em ~6,28 s, em qualquer FPS)
 #define ORBIT_RADIUS  3.0f
 #define DT_MAX        0.100f  // s: trava o dt p/ um engasgo (carga, 1º quadro) não "teleportar" a câmera
 #define DT_MIN        0.0001f
-
-#define KOKIRI_SCALE  0.5f
-#define KOKIRI_CX     (0.0f)
-#define KOKIRI_CZ     (0.0f)
-#define KOKIRI_GROUND_Y (-1.4f)
 
 // ---- SD card ----
 #ifndef SD_CS
