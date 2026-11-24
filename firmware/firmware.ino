@@ -172,7 +172,7 @@ struct Model;           // defined later in R3D engine
 struct MeshletBuild;    // defined later
 struct RzMesh;          // packed mesh header from .rzobj
 struct LuaModel3D;      // Lua userdata wrapper
-struct TexCell { int x0, y0; uint32_t e00, e10, e01, e11; };   // cache da célula 2x2 do filtro de textura (ver texel3c)
+struct TexCell { int x0, y0; int r0, r1, cx0, cx1; uint32_t e00, e10, e01, e11; };   // cache da célula 2x2 do filtro de textura (ver texel3c)
 // (no topo: o Arduino gera protótipos das funções FORCE_INLINE antes dos tipos definidos mais abaixo)
 // Hi-Z de UMA faixa (cada contexto de raster tem o seu: sem compartilhamento entre núcleos).
 // t[] guarda, por tile 8x8, o MENOR z já gravado (z = 1/w escalado; maior = mais perto). Como o z-buffer só cresce, um Hi-Z
@@ -4093,16 +4093,28 @@ static_assert(SPAN_N >= 1 && SPAN_N <= SPAN_FAR, "SPAN_N deve estar entre 1 e SP
 #define FAST_RCP      1     // 1 = recíproco por Newton em vez de divisão (o ESP32-S3 não tem divisão de float em hardware)
 #endif
 // ---- filtro de textura estilo Nintendo 64 (bilinear de 3 pontos) ----
+#ifndef TEX_TILED
+#define TEX_TILED     1     // 1 = texturas guardadas em blocos 4x4 texels (32 B = 1 linha do cache da PSRAM): amostrar em qualquer direção/rotação
+#endif                      // toca ~1 linha por 4 pixels em vez de ~1 por pixel (leitura linha-a-linha só é boa se u andar ao longo da linha). 0 = linear (A/B)
 #ifndef TEX_FILTER
 #define TEX_FILTER    1     // 1 = filtra textura AMPLIADA (o "blurzinho" do Ocarina of Time). 0 = amostragem por ponto (original, bit a bit)
 #endif
 #ifndef TEXFILTER_MAXSTEP
 #define TEXFILTER_MAXSTEP 1.0f  // só filtra onde a textura anda <= este nº de texels por pixel (1.0 = ampliada / 1:1). Menor = mais barato
 #endif
+#ifndef TEXFILTER_MIN_RUN
+#define TEXFILTER_MIN_RUN 0     // OPCIONAL (aproximação): spans com menos pixels que isto usam amostragem por ponto (pula a montagem da célula, que
+#endif                          // custa ~4 pixels de trabalho). 0 = desligado = imagem idêntica. Ex.: 2 ou 3 acelera modelos com muitos triângulos pequenos
+#if TEXFILTER_MIN_RUN > 0
+#define FILT_RUN_OK(n) ((n) >= TEXFILTER_MIN_RUN)
+#else
+#define FILT_RUN_OK(n) true
+#endif
 #ifndef TEX_BYTESWAPPED
 #define TEX_BYTESWAPPED 1   // texturas em RGB565 com os bytes trocados (formato do painel, como o buffer de cor). Cores estranhas => 0
 #endif
-#define FILT_LIM ((int32_t)(TEXFILTER_MAXSTEP * 65536.0f))
+static int32_t gFiltLim = (int32_t)(TEXFILTER_MAXSTEP * 65536.0f);   // ajustável em runtime: Render3D_SetFilter(maxStep)
+#define FILT_LIM gFiltLim
 #ifndef R3D_FPS_OVERLAY
 #define R3D_FPS_OVERLAY 0   // 1 = desenha "FPS:xx.x" no canto do quadro 3D (na tarefa de blit)
 #endif
@@ -4129,7 +4141,7 @@ static_assert(SPAN_N >= 1 && SPAN_N <= SPAN_FAR, "SPAN_N deve estar entre 1 e SP
 #define OPT_CONE       1    // backface culling em BLOCO: cone de normais por meshlet (só modelos estáticos com culling ligado)
 #endif
 #ifndef OPT_HIZ
-#define OPT_HIZ        1    // Hi-Z por faixa: mínimo do z-buffer por tile 8x8, reconstruído no meio do quadro
+#define OPT_HIZ        0    // Hi-Z por faixa: mínimo do z-buffer por tile 8x8, reconstruído no meio do quadro
 #endif
 #ifndef OPT_HIZ_TRI
 #define OPT_HIZ_TRI    1    // usa o Hi-Z também por TRIÂNGULO (antes de montar gradientes / rasterizar)
@@ -4157,6 +4169,8 @@ static_assert(SPAN_N >= 1 && SPAN_N <= SPAN_FAR, "SPAN_N deve estar entre 1 e SP
 #define HIZ_REFRESH_MAX 96  // teto do intervalo adaptativo de reconstrução do Hi-Z (cena sem oclusão não paga a varredura)
 #endif
 #define HIZ_MARGIN     3    // folga (em unidades de z de 16 bits) p/ erro de arredondamento de rcpf/interpolação: só oclui com certeza
+// PROFILER do 3D: 0 = desligado (padrão: zero custo, nada é compilado/impresso). 1 = imprime no Serial 1x por segundo.
+// ESTA é a única definição com valor padrão (antes havia outra, depois, com default 0: a primeira, =1, vencia e o profiler nunca desligava).
 #ifndef R3D_PROFILE
 #define R3D_PROFILE 0
 #endif
@@ -4286,6 +4300,76 @@ struct Meshlet {
 };
 struct TexData { uint16_t* data; int w, h; bool repeat; };
 
+// @@SKIN_STRUCTS_BEGIN
+// ---- skinning preguiçoso: dados ESTÁTICOS por meshlet (compartilhados entre instâncias) ----
+// Meshlet "rígido" = todos os vértices presos a UM osso com peso 255 (ou todos estáticos, bone = 255): a pose dele é uma
+// única matriz => AABB exata por transformação da caixa de bind, skinning sem pesos e cone de backface (no espaço do osso).
+// Meshlet "misto": uma caixa de bind POR OSSO que influencia (SkBox). Como cada vértice skinned é uma combinação convexa
+// (pesos somam 255) de P_k * p, ele fica dentro da união das caixas P_k * caixa_k => AABB conservativa SEM tocar nos vértices.
+static_assert(MAX_BONES <= 63, "mascara de ossos por meshlet e uint64_t (slot MAX_BONES = estatico)");
+struct SkMl  { float bc[3], bh[3]; uint16_t nb; uint8_t rigid, bone; uint32_t boxOff; };   // 32 B  (bc/bh = AABB no bind pose)
+struct SkBox { float c[3], h[3]; uint8_t bone; uint8_t pad[3]; };                          // 28 B  (bone 255 = vértices estáticos)
+static_assert(sizeof(SkMl) == 32 && sizeof(SkBox) == 28, "layout SkMl/SkBox");
+
+// caixa (c,h) transformada pela matriz afim 3x4 P: centro exato e meia-extensão |A|*h (AABB da caixa girada)
+FORCE_INLINE void skXformBox(const float* P, const float* c, const float* h, float* oc, float* oh) {
+  oc[0] = P[0]*c[0] + P[1]*c[1] + P[2]*c[2]  + P[3];
+  oc[1] = P[4]*c[0] + P[5]*c[1] + P[6]*c[2]  + P[7];
+  oc[2] = P[8]*c[0] + P[9]*c[1] + P[10]*c[2] + P[11];
+  oh[0] = fabsf(P[0])*h[0] + fabsf(P[1])*h[1] + fabsf(P[2])*h[2];
+  oh[1] = fabsf(P[4])*h[0] + fabsf(P[5])*h[1] + fabsf(P[6])*h[2];
+  oh[2] = fabsf(P[8])*h[0] + fabsf(P[9])*h[1] + fabsf(P[10])*h[2];
+}
+
+// Normaliza os 4 pesos de UM vértice (sk[0..3] ossos, sk[4..7] pesos): ossos fora do esqueleto -> 0, pesos nulos compactados
+// para o início, soma EXATAMENTE 255 (a conservatividade da AABB depende disso). Todos os pesos nulos => estático.
+static void normalizeSkinWeights(uint8_t* sk, int boneCnt) {
+  int bi[4], w[4], m = 0, sum = 0;
+  for (int k = 0; k < 4; ++k) if (sk[4 + k]) { bi[m] = (sk[k] >= boneCnt) ? 0 : sk[k]; w[m] = sk[4 + k]; sum += w[m]; ++m; }
+  if (m == 0) { memset(sk, 0, 8); return; }
+  if (sum != 255) {
+    int acc = 0, big = 0;
+    for (int k = 0; k < m; ++k) { w[k] = (w[k] * 255 + sum / 2) / sum; acc += w[k]; if (w[k] > w[big]) big = k; }
+    w[big] += 255 - acc;
+    int n2 = 0;
+    for (int k = 0; k < m; ++k) if (w[k] > 0) { bi[n2] = bi[k]; w[n2] = w[k]; ++n2; }
+    m = n2;
+  }
+  for (int k = 0; k < 4; ++k) { sk[k] = (uint8_t)(k < m ? bi[k] : 0); sk[4 + k] = (uint8_t)(k < m ? w[k] : 0); }
+}
+
+// Backface em bloco: true se TODAS as faces do meshlet viram as costas p/ a câmera. (c,h) e (ex,ey,ez) no MESMO espaço do
+// cone (ca/cc foram medidos no bind pose); sg = ±1/127 conforme a mão da projeção (ver Model::prepare).
+FORCE_INLINE bool coneBackfacing(const int8_t* ca, unsigned cc, const float* c, const float* h, float ex, float ey, float ez, float sg) {
+  const float vx = c[0] - ex, vy = c[1] - ey, vz = c[2] - ez;
+  const float D = (vx*(float)ca[0] + vy*(float)ca[1] + vz*(float)ca[2]) * sg - (h[0] + h[1] + h[2]) * 1.01f;
+  if (D <= 0.0f) return false;
+  const float cut = (float)cc * (1.0f / 255.0f);
+  return D * D > cut * cut * (vx*vx + vy*vy + vz*vz);
+}
+
+// Meshlet rígido num osso b: a projeção do meshlet com a matriz P=pose[b] equivale à do bind pose com a câmera em P^-1*eye
+// e orientação multiplicada por sign(det A) (e3' = e3 * det A). Calcula (eye local, sg local) de TODOS os ossos; sg = 0 => osso
+// singular (sem cone). out[b] = { ex, ey, ez, sg }.
+static void skBoneEyes(const float* pose, int boneCnt, const float* eye, float coneSgn, float (*out)[4]) {
+  for (int b = 0; b < boneCnt; ++b) {
+    const float* P = pose + 12 * b;
+    const float a00 = P[0], a01 = P[1], a02 = P[2], a10 = P[4], a11 = P[5], a12 = P[6], a20 = P[8], a21 = P[9], a22 = P[10];
+    const float c00 = a11*a22 - a12*a21, c01 = a12*a20 - a10*a22, c02 = a10*a21 - a11*a20;
+    const float det = a00*c00 + a01*c01 + a02*c02;
+    if (fabsf(det) < 1e-12f) { out[b][0] = out[b][1] = out[b][2] = out[b][3] = 0.0f; continue; }
+    const float c10 = a02*a21 - a01*a22, c11 = a00*a22 - a02*a20, c12 = a01*a20 - a00*a21;
+    const float c20 = a01*a12 - a02*a11, c21 = a02*a10 - a00*a12, c22 = a00*a11 - a01*a10;
+    const float id = 1.0f / det;
+    const float dx = eye[0] - P[3], dy = eye[1] - P[7], dz = eye[2] - P[11];
+    out[b][0] = (c00*dx + c10*dy + c20*dz) * id;      // A^-1 = adj/det: linha i = coluna i dos cofatores
+    out[b][1] = (c01*dx + c11*dy + c21*dz) * id;
+    out[b][2] = (c02*dx + c12*dy + c22*dz) * id;
+    out[b][3] = (det > 0.0f) ? coneSgn : -coneSgn;
+  }
+}
+// @@SKIN_STRUCTS_END
+
 // contexto do construtor de meshlets (tipo declarado aqui: o Arduino gera protótipos antes da 1ª função)
 struct MeshletBuild {
   const float* pos; const float* uv; const uint32_t* idx; uint32_t V;
@@ -4364,6 +4448,7 @@ inline Mat4 matRotZ(float a){ Mat4 M=matIdentity(); float c=cosf(a), s=sinf(a); 
 inline Mat4 matMul(const Mat4 &A,const Mat4 &B){ Mat4 R={}; for(int i=0;i<4;i++) for(int j=0;j<4;j++){ float s=0; for(int k=0;k<4;k++) s+=A.m[i][k]*B.m[k][j]; R.m[i][j]=s; } return R; }
 
 // ---- helpers de skinning (matrizes afins 3x4, linha-maior, última linha implícita 0 0 0 1) ----
+static float gBoneEye[MAX_BONES][4];  // scratch de prepare(): câmera no espaço de cada osso (serial, 1 modelo por vez)
 static float gWorld[MAX_BONES][12];   // scratch do cálculo de pose: só o fluxo do loop() usa (updateAnim roda fora do quadro)
 
 // O = A * B (O não pode alias A nem B)
@@ -4376,10 +4461,21 @@ FORCE_INLINE void mul34(const float* A, const float* B, float* O) {
     O[4*r+3] = a0*B[3] + a1*B[7] + a2*B[11] + a3;
   }
 }
+// 1/sqrt(x) sem sqrtf nem divisão (o S3 faz as duas em software): chute por bits + 1 Newton, erro relativo ~5e-6
+// (de sobra p/ normalizar quaternion). Só p/ x > 0 e finito.
+FORCE_INLINE float rsqrtf1(float x) {
+#if FAST_RCP
+  union { float f; uint32_t i; } u; u.f = x; u.i = 0x5F375A86u - (u.i >> 1);
+  const float y = u.f;
+  return y * (1.5f - 0.5f * x * y * y);
+#else
+  return 1.0f / sqrtf(x);
+#endif
+}
 FORCE_INLINE void qnorm4(float* q) {
   const float l = q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3];
   if (l < 1e-12f) { q[0] = q[1] = q[2] = 0.0f; q[3] = 1.0f; return; }
-  const float k = 1.0f / sqrtf(l);
+  const float k = rsqrtf1(l);
   q[0] *= k; q[1] *= k; q[2] *= k; q[3] *= k;
 }
 
@@ -4458,15 +4554,37 @@ FORCE_INLINE float pow2Inv(int n) { union { uint32_t i; float f; } u; u.i = (uin
 FORCE_INLINE float min3f(float a, float b, float c) { float m = a < b ? a : b; return m < c ? m : c; }
 FORCE_INLINE float max3f(float a, float b, float c) { float m = a > b ? a : b; return m > c ? m : c; }
 
+// ---- layout da textura ----
+// Índice de um texel = texRow(y) + texCol(x) (separável). TEX_TILED: blocos 4x4 (tile = 16 texels * 2 B = 32 B), tiles em ordem de linha,
+// largura em tiles = tpr = (tw+3)>>2 (o excedente de largura/altura é preenchido com 0 no load e nunca é lido: clamp/wrap usam tw/th reais).
+#if TEX_TILED
+FORCE_INLINE int texRowOff(int y, int tw, int tws, int tpr, bool rep) { (void)tw; (void)tws; (void)rep; return (((y >> 2) * tpr) << 4) + ((y & 3) << 2); }
+FORCE_INLINE int texColOff(int x) { return ((x >> 2) << 4) + (x & 3); }
+#else
+FORCE_INLINE int texRowOff(int y, int tw, int tws, int tpr, bool rep) { (void)tpr; return rep ? (y << tws) : y * tw; }
+FORCE_INLINE int texColOff(int x) { return x; }
+#endif
+// bytes que a textura ocupa na memória (com o preenchimento dos blocos)
+static inline size_t texBytes(int w, int h) {
+#if TEX_TILED
+  return (size_t)((w + 3) >> 2) * (size_t)((h + 3) >> 2) * 32;
+#else
+  return (size_t)w * (size_t)h * 2;
+#endif
+}
+// Offsets de coluna/linha de uma coordenada inteira (wrap por máscara p/ REPEAT, clamp p/ o resto)
+template<bool REP> FORCE_INLINE int texColAt(int x, int twm) {
+  if (REP) return texColOff(x & twm);
+  return texColOff(x < 0 ? 0 : (x > twm ? twm : x));
+}
+template<bool REP> FORCE_INLINE int texRowAt(int y, int thm, int tw, int tws, int tpr) {
+  if (REP) return texRowOff(y & thm, tw, tws, tpr, true);
+  return texRowOff(y < 0 ? 0 : (y > thm ? thm : y), tw, tws, tpr, false);
+}
+
 template<bool REP>
-FORCE_INLINE uint16_t texel(const uint16_t* __restrict tex, int tx, int ty, int tw, int tws, int twm, int thm) {
-  if (REP) {                                   // tw é potência de 2: índice por shift, sem multiplicação
-    tx &= twm; ty &= thm;
-    return tex[(ty << tws) + tx];
-  }
-  if ((unsigned)tx > (unsigned)twm) tx = (tx < 0) ? 0 : twm;
-  if ((unsigned)ty > (unsigned)thm) ty = (ty < 0) ? 0 : thm;
-  return tex[ty * tw + tx];
+FORCE_INLINE uint16_t texel(const uint16_t* __restrict tex, int tx, int ty, int tw, int tws, int tpr, int twm, int thm) {
+  return tex[texRowAt<REP>(ty, thm, tw, tws, tpr) + texColAt<REP>(tx, twm)];
 }
 
 // ---- bilinear de 3 pontos do N64 ----
@@ -4475,78 +4593,89 @@ FORCE_INLINE uint16_t texel(const uint16_t* __restrict tex, int tx, int ty, int 
 //   fu+fv >= 1:  t11 + (1-fu)*(t01-t11) + (1-fv)*(t10-t11)  pesos (fu+fv-1, 1-fu, 1-fv)
 // É isso que dá o aspecto "borrado com diagonais" do Ocarina. A amostra é no CENTRO do texel (u-0,5), como no N64.
 // Pesos em 5 bits (somam 32) e mistura dos 3 canais de uma vez: cada canal vira um campo de 32 bits com folga p/ o produto.
+//
+// Layout dos campos (escolhido p/ NÃO precisar desfazer o byte-swap do painel nem por texel nem por pixel):
+//   R em 0..4 (produto por peso ocupa 0..9) | G em 10..15 (10..20) | B em 21..25 (21..30)  -> nenhum produto invade o vizinho.
+// O texel do painel (bytes trocados) tem G partido em 0..2 e 13..15; os dois pedaços caem em 10..12 e 13..15 do campo com 2 shifts.
+// Resultado BIT A BIT igual ao da versão anterior (mesmos pesos, mesma truncagem por canal), só com bem menos instruções.
+#define FX_MASK 0x03E0FC1Fu
 FORCE_INLINE uint32_t ex565(uint32_t s) {
 #if TEX_BYTESWAPPED
-  s = ((s << 8) | (s >> 8)) & 0xFFFFu;       // texel do painel (bytes trocados) -> RGB565 nativo
-#endif
-  return (s | (s << 16)) & 0x07E0F81Fu;      // B em 0..4, R em 11..15, G em 21..26
-}
-template<bool REP>
-FORCE_INLINE uint16_t texel3(const uint16_t* __restrict tex, int32_t u, int32_t v, int tw, int tws, int twm, int thm) {
-  u -= 0x8000; v -= 0x8000;
-  const int x0 = u >> 16, y0 = v >> 16;
-  const int fu = (u >> 11) & 31, fv = (v >> 11) & 31;
-  int cx0, cx1, r0, r1;
-  if (REP) {
-    cx0 = x0 & twm; cx1 = (x0 + 1) & twm;
-    r0 = (y0 & thm) << tws; r1 = ((y0 + 1) & thm) << tws;
-  } else {
-    cx0 = x0 < 0 ? 0 : (x0 > twm ? twm : x0);  cx1 = x0 + 1 < 0 ? 0 : (x0 + 1 > twm ? twm : x0 + 1);
-    const int ya = y0 < 0 ? 0 : (y0 > thm ? thm : y0), yb = y0 + 1 < 0 ? 0 : (y0 + 1 > thm ? thm : y0 + 1);
-    r0 = ya * tw; r1 = yb * tw;
-  }
-  uint32_t e0, e1, e2, w0, w1, w2;
-  if (fu + fv < 32) {
-    e0 = ex565(tex[r0 + cx0]); e1 = ex565(tex[r0 + cx1]); e2 = ex565(tex[r1 + cx0]);
-    w0 = 32 - fu - fv; w1 = fu; w2 = fv;
-  } else {
-    e0 = ex565(tex[r1 + cx1]); e1 = ex565(tex[r1 + cx0]); e2 = ex565(tex[r0 + cx1]);
-    w0 = fu + fv - 32; w1 = 32 - fu; w2 = 32 - fv;
-  }
-  const uint32_t r = ((e0 * w0 + e1 * w1 + e2 * w2) >> 5) & 0x07E0F81Fu;
-  const uint32_t n = (r | (r >> 16)) & 0xFFFFu;
-#if TEX_BYTESWAPPED
-  return (uint16_t)(((n << 8) | (n >> 8)) & 0xFFFFu);
+  return ((s >> 3) | (s << 13)) & FX_MASK;                 // texel do painel (bytes trocados) -> campos
 #else
-  return (uint16_t)n;
+  return ((s >> 11) | (s << 5) | (s << 21)) & FX_MASK;     // RGB565 nativo -> campos
 #endif
 }
-
+// soma ponderada (pesos somam 32) -> texel no formato do painel. O resultado de cada canal está nos 5/6 bits ALTOS do produto
+// (bits 5..9 / 15..20 / 26..30): um shift + uma máscara por metade já os coloca no lugar final, sem montar o RGB565 nativo antes.
+FORCE_INLINE uint16_t fxPack(uint32_t sum) {
+#if TEX_BYTESWAPPED
+  return (uint16_t)(((sum >> 2) & 0xE0F8u) | ((sum >> 18) & 0x1F07u));
+#else
+  return (uint16_t)((sum >> 26) | ((sum >> 10) & 0x07E0u) | ((sum << 6) & 0xF800u));
+#endif
+}
 // ---- versão com cache de célula (usada pelos laços de span) ----
 // Com a textura AMPLIADA (<= 1 texel por pixel) vários pixels seguidos caem na mesma célula 2x2 (x0,y0). Guardamos os 4 texels
-// já expandidos (ex565) e só recarregamos quando a célula muda: o resultado é IDÊNTICO ao texel3(), mas poupa 3 leituras da
-// PSRAM/internal + 3 expansões por pixel na maioria dos pixels. u,v chegam JÁ com o deslocamento de meio texel (-0x8000)
+// já expandidos (ex565) e só recarregamos quando a célula muda: o resultado é IDÊNTICO ao filtro sem cache, mas poupa leituras da
+// PSRAM/internal + expansões por pixel na maioria dos pixels. u,v chegam JÁ com o deslocamento de meio texel (-0x8000)
 // aplicado 1x no início do trecho (aritmética inteira: u += du é linear, então somar antes ou depois dá o mesmo valor).
+// A célula é função só de (x0,y0) CRUS (wrap/clamp são aplicados ao ler), então o mesmo TexCell pode atravessar os trechos de um
+// span (ver fillSpan): se o ponto inicial do trecho seguinte cai na mesma célula ou numa vizinha, nada é recarregado.
 // (struct TexCell definida no topo do arquivo, junto dos tipos R3D: o Arduino gera protótipos antes dela)
 
+// carga completa da célula (x0,y0)
 template<bool REP>
-FORCE_INLINE uint16_t texel3c(const uint16_t* __restrict tex, int32_t u, int32_t v, int tw, int tws, int twm, int thm, TexCell& c) {
-  const int x0 = u >> 16, y0 = v >> 16;
-  if (x0 != c.x0 || y0 != c.y0) {
-    int cx0, cx1, r0, r1;
-    if (REP) {
-      cx0 = x0 & twm; cx1 = (x0 + 1) & twm;
-      r0 = (y0 & thm) << tws; r1 = ((y0 + 1) & thm) << tws;
-    } else {
-      cx0 = x0 < 0 ? 0 : (x0 > twm ? twm : x0);  cx1 = x0 + 1 < 0 ? 0 : (x0 + 1 > twm ? twm : x0 + 1);
-      const int ya = y0 < 0 ? 0 : (y0 > thm ? thm : y0), yb = y0 + 1 < 0 ? 0 : (y0 + 1 > thm ? thm : y0 + 1);
-      r0 = ya * tw; r1 = yb * tw;
-    }
-    c.x0 = x0; c.y0 = y0;
-    c.e00 = ex565(tex[r0 + cx0]); c.e10 = ex565(tex[r0 + cx1]);
-    c.e01 = ex565(tex[r1 + cx0]); c.e11 = ex565(tex[r1 + cx1]);
+FORCE_INLINE void cellLoad(const uint16_t* __restrict tex, int x0, int y0, int tw, int tws, int tpr, int twm, int thm, TexCell& c) {
+  c.cx0 = texColAt<REP>(x0, twm);               c.cx1 = texColAt<REP>(x0 + 1, twm);
+  c.r0  = texRowAt<REP>(y0, thm, tw, tws, tpr); c.r1  = texRowAt<REP>(y0 + 1, thm, tw, tws, tpr);
+  c.e00 = ex565(tex[c.r0 + c.cx0]); c.e10 = ex565(tex[c.r0 + c.cx1]);
+  c.e01 = ex565(tex[c.r1 + c.cx0]); c.e11 = ex565(tex[c.r1 + c.cx1]);
+  c.x0 = x0; c.y0 = y0;
+}
+
+// Move a célula p/ (x0,y0). Textura ampliada anda <= 1 texel/pixel: cada eixo muda no máximo 1 por pixel. Cada eixo é tratado
+// SEPARADO (o diagonal, que é comum com UV girado, vira "um passo em x + um passo em y" em vez de recarga completa): a célula
+// nova reaproveita os texels já expandidos e só calcula/lê/expande o que é novo. (célula inicial = sentinela 0x7FFFFFFF e saltos
+// maiores que 1, ex.: Render3D_SetFilter com maxStep > 1, caem na recarga completa)
+template<bool REP>
+FORCE_INLINE void cellMove(const uint16_t* __restrict tex, int x0, int y0, int tw, int tws, int tpr, int twm, int thm, TexCell& c) {
+  const uint32_t dx = (uint32_t)x0 - (uint32_t)c.x0, dy = (uint32_t)y0 - (uint32_t)c.y0;
+  if (dx != 0u) {
+    if (dx == 1u) {
+      c.cx0 = c.cx1; c.cx1 = texColAt<REP>(x0 + 1, twm);
+      c.e00 = c.e10; c.e01 = c.e11;
+      c.e10 = ex565(tex[c.r0 + c.cx1]); c.e11 = ex565(tex[c.r1 + c.cx1]);
+    } else if (dx == 0xFFFFFFFFu) {
+      c.cx1 = c.cx0; c.cx0 = texColAt<REP>(x0, twm);
+      c.e10 = c.e00; c.e11 = c.e01;
+      c.e00 = ex565(tex[c.r0 + c.cx0]); c.e01 = ex565(tex[c.r1 + c.cx0]);
+    } else { cellLoad<REP>(tex, x0, y0, tw, tws, tpr, twm, thm, c); return; }
   }
-  const int fu = (u >> 11) & 31, fv = (v >> 11) & 31;
-  uint32_t e0, e1, e2, w0, w1, w2;
-  if (fu + fv < 32) { e0 = c.e00; e1 = c.e10; e2 = c.e01; w0 = 32 - fu - fv; w1 = fu; w2 = fv; }
-  else              { e0 = c.e11; e1 = c.e01; e2 = c.e10; w0 = fu + fv - 32; w1 = 32 - fu; w2 = 32 - fv; }
-  const uint32_t r = ((e0 * w0 + e1 * w1 + e2 * w2) >> 5) & 0x07E0F81Fu;
-  const uint32_t n = (r | (r >> 16)) & 0xFFFFu;
-#if TEX_BYTESWAPPED
-  return (uint16_t)(((n << 8) | (n >> 8)) & 0xFFFFu);
-#else
-  return (uint16_t)n;
-#endif
+  if (dy != 0u) {
+    if (dy == 1u) {
+      c.r0 = c.r1; c.r1 = texRowAt<REP>(y0 + 1, thm, tw, tws, tpr);
+      c.e00 = c.e01; c.e10 = c.e11;
+      c.e01 = ex565(tex[c.r1 + c.cx0]); c.e11 = ex565(tex[c.r1 + c.cx1]);
+    } else if (dy == 0xFFFFFFFFu) {
+      c.r1 = c.r0; c.r0 = texRowAt<REP>(y0, thm, tw, tws, tpr);
+      c.e01 = c.e00; c.e11 = c.e10;
+      c.e00 = ex565(tex[c.r0 + c.cx0]); c.e10 = ex565(tex[c.r0 + c.cx1]);
+    } else { cellLoad<REP>(tex, x0, y0, tw, tws, tpr, twm, thm, c); return; }
+  }
+  c.x0 = x0; c.y0 = y0;
+}
+
+template<bool REP>
+FORCE_INLINE uint16_t texel3c(const uint16_t* __restrict tex, int32_t u, int32_t v, int tw, int tws, int tpr, int twm, int thm, TexCell& c) {
+  const int x0 = u >> 16, y0 = v >> 16;
+  if (x0 != c.x0 || y0 != c.y0) cellMove<REP>(tex, x0, y0, tw, tws, tpr, twm, thm, c);
+  const uint32_t fu = ((uint32_t)u >> 11) & 31u, fv = ((uint32_t)v >> 11) & 31u;
+  const uint32_t s = fu + fv;
+  uint32_t sum;
+  if (s < 32u) sum = c.e00 * (32u - s)  + c.e10 * fu          + c.e01 * fv;           // triângulo superior-esquerdo
+  else         sum = c.e11 * (s - 32u)  + c.e01 * (32u - fu)  + c.e10 * (32u - fv);   // triângulo inferior-direito
+  return fxPack(sum);
 }
 
 // AFF: uw/vw/duw/dvw já vêm em TEXELS (u,v lineares na tela); senão são u/w, v/w (perspectiva).
@@ -4570,16 +4699,17 @@ FORCE_INLINE void fillSpan(uint16_t* __restrict crow, uint16_t* __restrict zrow,
 
   const int twm = tw - 1, thm = th - 1;
   const int tws = REP ? __builtin_ctz((unsigned)tw) : 0;
+  const int tpr = (tw + 3) >> 2;          // largura em blocos 4x4 (só usada com TEX_TILED)
 
   if (AFF) {
     int32_t u = (int32_t)(uw * 65536.0f), v = (int32_t)(vw * 65536.0f);
     const int32_t du = (int32_t)(duw * 65536.0f), dv = (int32_t)(dvw * 65536.0f);
-    if (FILT && (du < 0 ? -du : du) <= FILT_LIM && (dv < 0 ? -dv : dv) <= FILT_LIM) {   // textura ampliada: filtra
+    if (FILT && FILT_RUN_OK(xe - xs + 1) && (du < 0 ? -du : du) <= FILT_LIM && (dv < 0 ? -dv : dv) <= FILT_LIM) {   // textura ampliada: filtra
       TexCell cell; cell.x0 = cell.y0 = 0x7FFFFFFF;
       u -= 0x8000; v -= 0x8000;                       // centro do texel (1x por span, não por pixel)
       for (int x = xs; x <= xe; ++x) {
         const int zi = z >> ZFRAC;
-        if (zi >= (int)zrow[x]) { crow[x] = texel3c<REP>(tex, u, v, tw, tws, twm, thm, cell); zrow[x] = (uint16_t)zi; }
+        if (zi >= (int)zrow[x]) { crow[x] = texel3c<REP>(tex, u, v, tw, tws, tpr, twm, thm, cell); zrow[x] = (uint16_t)zi; }
         z += dz; u += du; v += dv;
       }
       return;
@@ -4587,7 +4717,7 @@ FORCE_INLINE void fillSpan(uint16_t* __restrict crow, uint16_t* __restrict zrow,
     for (int x = xs; x <= xe; ++x) {
       const int zi = z >> ZFRAC;
       if (zi >= (int)zrow[x]) {
-        const uint16_t c = texel<REP>(tex, u >> 16, v >> 16, tw, tws, twm, thm);
+        const uint16_t c = texel<REP>(tex, u >> 16, v >> 16, tw, tws, tpr, twm, thm);
         if (!(KEY && c == 0)) { crow[x] = c; zrow[x] = (uint16_t)zi; }
       }
       z += dz; u += du; v += dv;
@@ -4601,6 +4731,8 @@ FORCE_INLINE void fillSpan(uint16_t* __restrict crow, uint16_t* __restrict zrow,
   float rw = rcpf(iw > 1e-7f ? iw : 1e-7f);
   float ucR = uw * rw, vcR = vw * rw;
   int x = xs;
+  TexCell cell; cell.x0 = cell.y0 = 0x7FFFFFFF;   // 1 cache p/ o span inteiro: o trecho seguinte começa quase sempre na mesma célula (ou numa vizinha)
+  const bool filtOn = FILT && FILT_RUN_OK(xe - xs + 1);
   while (x <= xe) {
     // trecho adaptativo: se 1/w muda menos de ~6% em SPAN_FAR pixels, interpolar u,v linearmente é quase exato
     int n = xe - x + 1;
@@ -4620,19 +4752,18 @@ FORCE_INLINE void fillSpan(uint16_t* __restrict crow, uint16_t* __restrict zrow,
     int32_t u = (int32_t)(uc * 65536.0f), v = (int32_t)(vc * 65536.0f);
     const int32_t du = (int32_t)((un - uc) * inv), dv = (int32_t)((vn - vc) * inv);
 
-    if (FILT && (du < 0 ? -du : du) <= FILT_LIM && (dv < 0 ? -dv : dv) <= FILT_LIM) {   // este trecho está ampliado: filtra
-      TexCell cell; cell.x0 = cell.y0 = 0x7FFFFFFF;
+    if (filtOn && (du < 0 ? -du : du) <= FILT_LIM && (dv < 0 ? -dv : dv) <= FILT_LIM) {   // este trecho está ampliado: filtra
       u -= 0x8000; v -= 0x8000;
       for (int i = 0; i < n; ++i, ++x) {
         const int zi = z >> ZFRAC;
-        if (zi >= (int)zrow[x]) { crow[x] = texel3c<REP>(tex, u, v, tw, tws, twm, thm, cell); zrow[x] = (uint16_t)zi; }
+        if (zi >= (int)zrow[x]) { crow[x] = texel3c<REP>(tex, u, v, tw, tws, tpr, twm, thm, cell); zrow[x] = (uint16_t)zi; }
         z += dz; u += du; v += dv;
       }
     } else {
       for (int i = 0; i < n; ++i, ++x) {
         const int zi = z >> ZFRAC;
         if (zi >= (int)zrow[x]) {
-          const uint16_t c = texel<REP>(tex, u >> 16, v >> 16, tw, tws, twm, thm);
+          const uint16_t c = texel<REP>(tex, u >> 16, v >> 16, tw, tws, tpr, twm, thm);
           if (!(KEY && c == 0)) { crow[x] = c; zrow[x] = (uint16_t)zi; }
         }
         z += dz; u += du; v += dv;
@@ -4684,6 +4815,9 @@ static void HOT rasterTri(const Target &T, int fi, int cull, const uint16_t* tda
   float miny = y0 < y1 ? y0 : y1; if (y2 < miny) miny = y2;
   float maxy = y0 > y1 ? y0 : y1; if (y2 > maxy) maxy = y2;
   if (maxx < 0.0f || minx >= fW || maxy < (float)T.y0 || miny >= (float)T.y1) return;
+  // Sem nenhum centro de pixel dentro da caixa (em x ou em y) => nenhum span: mesmo critério (ceil(v-0.5)) dos laços abaixo,
+  // então o resultado é idêntico, mas triângulos sub-pixel (comuns a 240x160) saem antes da área, da ordenação e dos gradientes.
+  if (ceilToInt(maxy - 0.5f) <= ceilToInt(miny - 0.5f) || ceilToInt(maxx - 0.5f) <= ceilToInt(minx - 0.5f)) return;
 
   const float ax = x1 - x0, ay = y1 - y0, bx = x2 - x0, by = y2 - y0;
   const float area = ax*by - bx*ay;
@@ -5049,9 +5183,15 @@ struct Model {
   float*    from = nullptr;      // TRS locais exibidos quando o crossfade começou
   float*    out = nullptr;       // TRS locais exibidos (resultado do crossfade)
   float*    pose = nullptr;      // matrizes de skin por osso: mundo * invBind
+  SkMl*     skm = nullptr;       // por meshlet: caixa de bind / rígido / caixas por osso (COMPARTILHADO com as instâncias)
+  SkBox*    skBoxes = nullptr;   // pool das caixas por osso dos meshlets mistos (compartilhado)
+  uint32_t* mlVer = nullptr;     // por meshlet (POR INSTÂNCIA): versão da pose com que vskin foi calculado; != poseVer => vskin velho
+  uint32_t  poseVer = 1;         // sobe a cada pose nova (applyPose)
+  int       skinPending = 0;     // meshlets visíveis neste quadro com vskin velho (prepare); 0 => nenhum trabalho de skinning
   int       animClip = -1;
   float     animT = 0.0f, animSpeed = 1.0f;
   bool      animLoop = true, animPlay = false, blending = false;
+  bool      poseDirty = false;   // updateAnim adiou a pose enquanto a instância estava escondida (isVisible = false)
   float     blendT = 0.0f, blendDur = 0.0f;
 
   // ---- instâncias ----
@@ -5105,6 +5245,10 @@ struct Model {
     animPlay = false; blending = false; animClip = -1; animT = 0.0f;
     if (vskin)   heap_caps_free(vskin);
     if (vsk)     heap_caps_free(vsk);
+    if (skm)     heap_caps_free(skm);
+    if (skBoxes) heap_caps_free(skBoxes);
+    if (mlVer)   heap_caps_free(mlVer);
+    skm = nullptr; skBoxes = nullptr; mlVer = nullptr; skinPending = 0; poseVer = 1;
     if (bones)   heap_caps_free(bones);
     if (clips)   heap_caps_free(clips);
     if (keyPool) heap_caps_free(keyPool);
@@ -5125,6 +5269,8 @@ struct Model {
     if (vflag)   heap_caps_free(vflag);
     if (vskin)   heap_caps_free(vskin);
     if (animMem) heap_caps_free(animMem);
+    if (mlVer)   heap_caps_free(mlVer);
+    mlVer = nullptr; skm = nullptr; skBoxes = nullptr; skinPending = 0; poseVer = 1;
     ml = nullptr; ownMl = false;
     order = nullptr; skey = nullptr; vis = nullptr; vflag = nullptr;
     vskin = nullptr; animMem = nullptr; cur = from = out = pose = nullptr;
@@ -5164,6 +5310,11 @@ struct Model {
       if (!vskin) { unloadClone(); return false; }
       memcpy(vskin, s.vpool, sizeof(Vtx) * (size_t)poolV);
       vdraw = vskin;
+      skm = s.skm; skBoxes = s.skBoxes;
+      mlVer = (uint32_t*)allocFast(sizeof(uint32_t) * n, "skin versao (inst)", false);
+      if (!mlVer) { unloadClone(); return false; }
+      memset(mlVer, 0, sizeof(uint32_t) * n);
+      poseVer = 1;
       animMem = (float*)allocFast(sizeof(float) * (size_t)boneCount * (10 * 3 + 12), "pose/anim (inst)", true);
       if (!animMem) { unloadClone(); return false; }
       cur = animMem; from = cur + 10 * boneCount; out = from + 10 * boneCount; pose = out + 10 * boneCount;
@@ -5310,14 +5461,36 @@ struct Model {
       }
       texCount = (int)h.texCount;
       for (int i = 0; i < texCount; ++i) {
-        const size_t bytes = (size_t)texs[i].w * texs[i].h * 2;
-        texs[i].data = (uint16_t*)allocFast(bytes, "textura", false);
-        if (!texs[i].data || !readAll(f, texs[i].data, bytes)) { f.close(); return false; }
+        const int tw_ = texs[i].w, th_ = texs[i].h;
+        const size_t lin = (size_t)tw_ * th_ * 2;
+#if TEX_TILED
+        // o arquivo é linha a linha: lê pra um buffer temporário e reorganiza em blocos 4x4 (preenchimento = 0)
+        const size_t bytes = texBytes(tw_, th_);
+        // alinhada a 32 B: cada bloco 4x4 (32 B) cai inteiro numa linha do cache (sem alinhamento ele atravessaria 2 linhas)
+        texs[i].data = (uint16_t*)heap_caps_aligned_alloc(32, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!texs[i].data) { errf("sem memoria: textura (%u B)", (unsigned)bytes); f.close(); return false; }
+        {
+          Scoped sTmp;
+          uint16_t* src = (uint16_t*)(sTmp.p = allocFast(lin, "textura (tmp)", false));
+          if (!src || !readAll(f, src, lin)) { f.close(); return false; }
+          memset(texs[i].data, 0, bytes);
+          const int tpr_ = (tw_ + 3) >> 2;
+          for (int y = 0; y < th_; ++y) {
+            const int ro = (((y >> 2) * tpr_) << 4) + ((y & 3) << 2);
+            const uint16_t* sr = src + (size_t)y * tw_;
+            for (int x = 0; x < tw_; ++x) texs[i].data[ro + ((x >> 2) << 4) + (x & 3)] = sr[x];
+          }
+        }
+#else
+        texs[i].data = (uint16_t*)allocFast(lin, "textura", false);
+        if (!texs[i].data || !readAll(f, texs[i].data, lin)) { f.close(); return false; }
+#endif
       }
     }
 
     // bloco de skin (ossos, clipes, keyframes): depois das texturas
     if (rawSk && !loadSkin(f)) { f.close(); return false; }
+    if (rawSk && !buildSkinInfo()) { f.close(); return false; }   // caixas de bind / meshlets rígidos (precisa de vsk + boneCount)
 
     f.close();
     vertCount = (int)h.vertCount;
@@ -5422,8 +5595,10 @@ struct Model {
   // Avança o relógio da animação em dt segundos e, se algo mudou, refaz a pose e os vértices. Custo zero com tudo parado.
   // Chame 1x por quadro ANTES de renderScene() (ex.: no loop(), logo após calcular o dt).
   void updateAnim(float dt) {
-    if (!pose || (!animPlay && !blending)) return;
+    if (!pose || (!animPlay && !blending && !poseDirty)) return;
     const int n = 10 * boneCount;
+    const bool wasPlaying = animPlay;
+    // 1) relógio (barato): sempre avança, mesmo com a instância escondida
     if (animPlay) {
       const AnimClip& c = clips[animClip];
       const float d = c.duration;
@@ -5435,10 +5610,15 @@ struct Model {
       } else if (animSpeed >= 0.0f ? (animT >= d) : (animT <= 0.0f)) {
         animT = (animSpeed >= 0.0f) ? d : 0.0f; animPlay = false;   // fim: segura o último quadro
       }
-      sampleClip(c, animT, cur);
     }
+    if (blending) blendT += dt;
+
+    // 2) instância escondida: nada vai ser desenhado, então adia amostragem + pose + AABBs (a parte cara) até ela voltar a ser visível
+    if (!isVisible) { poseDirty = true; return; }
+
+    // 3) amostragem + mistura + pose
+    if ((wasPlaying || poseDirty) && animClip >= 0) sampleClip(clips[animClip], animT, cur);
     if (blending) {
-      blendT += dt;
       const float a = (blendDur > 0.0f) ? blendT / blendDur : 1.0f;
       if (a >= 1.0f) { blending = false; memcpy(out, cur, sizeof(float) * (size_t)n); }
       else blendLocal(a);
@@ -5520,45 +5700,135 @@ struct Model {
     }
   }
 
-  // cada vértice = soma(peso * pose[osso] * posição_bind), 1 meshlet por vez; recalcula a AABB do meshlet
-  void skinVertices() {
-    if (!vskin || !vsk) return;
-    const int bc = boneCount;
-    const float k255 = 1.0f / 255.0f;
-    for (int i = 0; i < mlCount; ++i) {
-      Meshlet& s = ml[i];
+  // @@SKIN_CLASS_BEGIN
+  // ---- skinning PREGUIÇOSO por meshlet ----
+  // Antes: a cada pose nova TODOS os vértices (visíveis ou não) eram skinned, num núcleo só, e a AABB de cada meshlet saía de
+  // 6 comparações por vértice. Agora:
+  //  1) applyPose() só monta as matrizes (poucos ossos) e a AABB conservativa de cada meshlet a partir das caixas de bind
+  //     (updateSkinBounds): frustum/z-order/Hi-Z já funcionam sem nenhum vértice skinned;
+  //  2) prepare() conta quantos meshlets VISÍVEIS estão com vskin velho (mlVer != poseVer);
+  //  3) a fase de skinning (r3dRenderTo) divide esses meshlets entre os 2 núcleos ANTES das faixas (skinMeshlet).
+  // Meshlet de fora da tela / de outro modelo não custa nada; pose parada não custa nada.
+  bool buildSkinInfo() {
+    if (!vsk || boneCount <= 0 || mlCount <= 0) return true;
+    const int n = mlCount;
+    skm   = (SkMl*)    allocFast(sizeof(SkMl) * (size_t)n,      "skin meshlets", false);
+    mlVer = (uint32_t*)allocFast(sizeof(uint32_t) * (size_t)n,  "skin versao",   false);
+    if (!skm || !mlVer) return false;
+    memset(mlVer, 0, sizeof(uint32_t) * (size_t)n);
+    uint64_t* masks = (uint64_t*)allocFast(sizeof(uint64_t) * (size_t)n, "skin mascaras (tmp)", false);
+    if (!masks) return false;
+    uint32_t totalBoxes = 0;
+    for (int i = 0; i < n; ++i) {                       // passo 1: normaliza pesos, caixa de bind, classifica
+      const Meshlet& s = ml[i];
       const Vtx* src = vpool + s.vOff;
-      Vtx* dst = vskin + s.vOff;
-      const uint8_t* sk = vsk + 8 * (size_t)s.vOff;
+      uint8_t* sk = vsk + 8 * (size_t)s.vOff;
       float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+      uint64_t mask = 0;
+      int code = -1;                                     // -1 vazio | 0..254 rígido no osso | 255 todos estáticos | -2 misto
       for (int j = 0; j < s.nv; ++j, sk += 8) {
-        const float x = src[j].x, y = src[j].y, z = src[j].z;
-        float ox = x, oy = y, oz = z;                      // peso[0] == 0: vértice estático (sem osso)
-        if (sk[4]) {
-          ox = oy = oz = 0.0f;
-          for (int k = 0; k < 4; ++k) {
-            const unsigned wt = sk[4 + k];
-            if (!wt) break;
-            unsigned bi = sk[k]; if (bi >= (unsigned)bc) bi = 0;
-            const float* P = pose + 12 * bi;
-            const float w = (float)wt * k255;
-            ox += w * (P[0]*x + P[1]*y + P[2]*z  + P[3]);
-            oy += w * (P[4]*x + P[5]*y + P[6]*z  + P[7]);
-            oz += w * (P[8]*x + P[9]*y + P[10]*z + P[11]);
-          }
+        normalizeSkinWeights(sk, boneCount);
+        const Vtx& p = src[j];
+        if (p.x < mn[0]) mn[0] = p.x;
+        if (p.x > mx[0]) mx[0] = p.x;
+        if (p.y < mn[1]) mn[1] = p.y;
+        if (p.y > mx[1]) mx[1] = p.y;
+        if (p.z < mn[2]) mn[2] = p.z;
+        if (p.z > mx[2]) mx[2] = p.z;
+        int c;
+        if (!sk[4])             { c = 255; mask |= 1ull << MAX_BONES; }
+        else if (sk[4] == 255)  { c = sk[0]; mask |= 1ull << sk[0]; }
+        else { c = -2; for (int k = 0; k < 4; ++k) if (sk[4 + k]) mask |= 1ull << sk[k]; }
+        if (code == -1) code = c; else if (code != c) code = -2;
+      }
+      SkMl& k = skm[i];
+      for (int a = 0; a < 3; ++a) { k.bc[a] = 0.5f * (mn[a] + mx[a]); k.bh[a] = 0.5f * (mx[a] - mn[a]); }
+      k.rigid = (code >= 0) ? 1 : 0;
+      k.bone  = (code >= 0) ? (uint8_t)code : 0;
+      k.nb    = k.rigid ? 0 : (uint16_t)__builtin_popcountll(mask);
+      k.boxOff = totalBoxes;
+      masks[i] = mask;
+      totalBoxes += k.nb;
+    }
+    if (totalBoxes) {
+      skBoxes = (SkBox*)allocFast(sizeof(SkBox) * (size_t)totalBoxes, "skin caixas", false);
+      if (!skBoxes) { heap_caps_free(masks); return false; }
+    }
+    for (int i = 0; i < n; ++i) {                       // passo 2: uma caixa de bind por osso, só nos meshlets mistos
+      const SkMl& k = skm[i];
+      if (k.rigid) continue;
+      const Meshlet& s = ml[i];
+      const Vtx* src = vpool + s.vOff;
+      const uint8_t* sk = vsk + 8 * (size_t)s.vOff;
+      float bmn[MAX_BONES + 1][3], bmx[MAX_BONES + 1][3];
+      for (int b = 0; b <= MAX_BONES; ++b) for (int a = 0; a < 3; ++a) { bmn[b][a] = 1e30f; bmx[b][a] = -1e30f; }
+      for (int j = 0; j < s.nv; ++j, sk += 8) {
+        const Vtx& p = src[j];
+        const float v[3] = { p.x, p.y, p.z };
+        for (int q = 0; q < 4; ++q) {
+          int slot;
+          if (!sk[4]) { if (q) break; slot = MAX_BONES; }
+          else { if (!sk[4 + q]) break; slot = sk[q]; }
+          for (int a = 0; a < 3; ++a) { if (v[a] < bmn[slot][a]) bmn[slot][a] = v[a]; if (v[a] > bmx[slot][a]) bmx[slot][a] = v[a]; }
         }
-        dst[j].x = ox; dst[j].y = oy; dst[j].z = oz;
-        if (ox < mn[0]) mn[0] = ox;
-        if (ox > mx[0]) mx[0] = ox;
-        if (oy < mn[1]) mn[1] = oy;
-        if (oy > mx[1]) mx[1] = oy;
-        if (oz < mn[2]) mn[2] = oz;
-        if (oz > mx[2]) mx[2] = oz;
+      }
+      SkBox* o = skBoxes + k.boxOff;
+      for (int b = 0; b <= MAX_BONES; ++b) {
+        if (!((masks[i] >> b) & 1ull)) continue;
+        for (int a = 0; a < 3; ++a) { o->c[a] = 0.5f * (bmn[b][a] + bmx[b][a]); o->h[a] = 0.5f * (bmx[b][a] - bmn[b][a]); }
+        o->bone = (b == MAX_BONES) ? 255 : (uint8_t)b;
+        o->pad[0] = o->pad[1] = o->pad[2] = 0;
+        ++o;
+      }
+    }
+    heap_caps_free(masks);
+    int rig = 0; for (int i = 0; i < n; ++i) rig += skm[i].rigid;
+    Serial.printf("  skin: %d de %d meshlets rigidos (skinning sem pesos + cone de backface), %u caixas por osso\n", rig, n, (unsigned)totalBoxes);
+    return true;
+  }
+
+  // AABB conservativa de cada meshlet na pose atual, SEM olhar vértices (ver comentário de SkMl).
+  void updateSkinBounds() {
+    if (!skm || !pose) return;
+    for (int i = 0; i < mlCount; ++i) {
+      const SkMl& k = skm[i];
+      Meshlet& s = ml[i];
+      if (k.rigid) {
+        if (k.bone == 255) { for (int a = 0; a < 3; ++a) { s.c[a] = k.bc[a]; s.h[a] = k.bh[a]; } }
+        else skXformBox(pose + 12 * (size_t)k.bone, k.bc, k.bh, s.c, s.h);
+        continue;
+      }
+      float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+      const SkBox* bx = skBoxes + k.boxOff;
+      for (int e = 0; e < (int)k.nb; ++e, ++bx) {
+        float c[3], h[3];
+        if (bx->bone == 255) { for (int a = 0; a < 3; ++a) { c[a] = bx->c[a]; h[a] = bx->h[a]; } }
+        else skXformBox(pose + 12 * (size_t)bx->bone, bx->c, bx->h, c, h);
+        for (int a = 0; a < 3; ++a) {
+          const float lo = c[a] - h[a], hi = c[a] + h[a];
+          if (lo < mn[a]) mn[a] = lo;
+          if (hi > mx[a]) mx[a] = hi;
+        }
       }
       for (int a = 0; a < 3; ++a) { s.c[a] = 0.5f * (mn[a] + mx[a]); s.h[a] = 0.5f * (mx[a] - mn[a]); }
     }
+  }
+
+  void applyPose() {
+    poseDirty = false;
+    buildPose();
+    updateSkinBounds();
+    if (++poseVer == 0) { poseVer = 1; if (mlVer) memset(mlVer, 0, sizeof(uint32_t) * (size_t)mlCount); }
     boundsDirty = true;      // as AABBs dos meshlets mudaram => a AABB do modelo também
   }
+
+  void skinMeshlet(int id);                              // definida depois da classe (IRAM, ver Model::draw)
+  // item `vi` da lista de visíveis: skinna o meshlet se o vskin dele está velho. Chamado pelos 2 núcleos (cada meshlet por 1 só).
+  void skinVisible(int vi) {
+    const int id = vis[vi] & 0x7FFF;
+    if (mlVer[id] != poseVer) skinMeshlet(id);
+  }
+  // @@SKIN_CLASS_END
 
   // AABB do modelo = união das AABBs dos meshlets (1 passada pelos cabeçalhos; só roda de novo se a pose mudou)
   void computeBounds() {
@@ -5575,7 +5845,6 @@ struct Model {
     boundsDirty = false;
   }
 
-  void applyPose() { buildPose(); skinVertices(); }
 
   Mat4 getModelMatrix() const {
     // = T * Rz * Ry * Rx * S, expandido na mão (antes: 6 matMul 4x4 + 3 matrizes de rotação por modelo por quadro)
@@ -5605,6 +5874,7 @@ struct Model {
   //  - cone de normais: se TODAS as faces do meshlet viram as costas p/ a câmera, o meshlet inteiro some (não projeta nem 1 vértice).
   void prepare(const Mat4 &MVP, float nearW, float farW = 0.0f) {
     visCount = 0;
+    skinPending = 0;
     if (mlCount <= 0 || !vis || !vflag) return;
     const float (*M)[4] = MVP.m;
     const bool doSort = (ML_SORT != 0) && order && skey && mlCount > 1;
@@ -5647,7 +5917,7 @@ struct Model {
     // "mão" da projeção (inclui escala negativa/espelho no modelo): área de tela > 0  <=>  sign(e3) * n·(A - câmera) > 0
     // (n = (B-A)x(C-A), A = vértice do triângulo). Verificado numericamente (20 mil triângulos/câmeras/modelos aleatórios).
     const bool noDbl = ignoreDouble();
-    bool coneOn = gOpt.cone && boneCount == 0 && cull != CULL_NONE;
+    bool coneOn = gOpt.cone && cull != CULL_NONE;   // skinned: só os meshlets RÍGIDOS usam o cone (câmera no espaço do osso)
     float eye[3] = { 0, 0, 0 }, coneSgn = 0.0f;
     if (coneOn) {
       const float* X = M[0]; const float* Y = M[1]; const float* W = M[3];
@@ -5667,6 +5937,8 @@ struct Model {
         coneSgn = ((cull == CULL_POS_AREA) ? q : -q) * (1.0f / 127.0f);
       }
     }
+    const bool skCone = coneOn && skm && pose && boneCount > 0;
+    if (skCone) skBoneEyes(pose, boneCount, eye, coneSgn, gBoneEye);
 
     // passe sequencial: chave de profundidade + teste de frustum de cada meshlet
     for (int i = 0; i < mlCount; ++i) {
@@ -5689,11 +5961,18 @@ struct Model {
       }
       if (coneOn && s.cc < 255 && (noDbl || !(s.flags & RZM_DOUBLE))) {
         // todas as faces de costas <=> dot(v, eixo) >= corte*|v| + raio   (v = centro - câmera; raio = soma das meias-extensões, >= esfera)
-        const float vx = s.c[0] - eye[0], vy = s.c[1] - eye[1], vz = s.c[2] - eye[2];
-        const float D = (vx*(float)s.ca[0] + vy*(float)s.ca[1] + vz*(float)s.ca[2]) * coneSgn - (s.h[0] + s.h[1] + s.h[2]) * 1.01f;
-        if (D > 0.0f) {
-          const float cut = (float)s.cc * (1.0f / 255.0f);
-          if (D * D > cut * cut * (vx*vx + vy*vy + vz*vz)) { R3D_STAT(sp, cone); vflag[i] = 0; continue; }
+        if (!skCone) {
+          if (coneBackfacing(s.ca, s.cc, s.c, s.h, eye[0], eye[1], eye[2], coneSgn)) { R3D_STAT(sp, cone); vflag[i] = 0; continue; }
+        } else {
+          const SkMl& k = skm[i];                  // skinned: só meshlet rígido; o cone vive no bind pose => câmera no espaço do osso
+          if (k.rigid) {
+            if (k.bone == 255) {
+              if (coneBackfacing(s.ca, s.cc, k.bc, k.bh, eye[0], eye[1], eye[2], coneSgn)) { R3D_STAT(sp, cone); vflag[i] = 0; continue; }
+            } else {
+              const float* be = gBoneEye[k.bone];
+              if (be[3] != 0.0f && coneBackfacing(s.ca, s.cc, k.bc, k.bh, be[0], be[1], be[2], be[3])) { R3D_STAT(sp, cone); vflag[i] = 0; continue; }
+            }
+          }
         }
       }
       if ((dN - eN) >= 0.0f) f = 2;             // MENOR w na caixa >= near: a projeção da caixa é confiável
@@ -5719,13 +5998,18 @@ struct Model {
       }
     }
 
-    int n = 0;
+    int n = 0, stale = 0;
+    const uint32_t* const mv = mlVer;             // nullptr => modelo estático
     for (int i = 0; i < mlCount; ++i) {
       const int id = order ? order[i] : i;
       const uint8_t f = vflag[id];
-      if (f) vis[n++] = (uint16_t)(id | (f == 2 ? 0x8000 : 0));
+      if (f) {
+        vis[n++] = (uint16_t)(id | (f == 2 ? 0x8000 : 0));
+        if (mv && mv[id] != poseVer) ++stale;
+      }
     }
     visCount = n;
+    skinPending = stale;
   }
 
   // Depois que os buffers grandes (z, cores, DMA) e as tarefas já existem: move pra internal RAM os arrays que o
@@ -5765,11 +6049,11 @@ struct Model {
       int best = -1; float bestScore = 0.0f;
       for (int i = 0; i < texCount; ++i) {
         if (!use[i] || !texs[i].data) continue;
-        const float sc = (float)use[i] / (float)((size_t)texs[i].w * texs[i].h * 2);
+        const float sc = (float)use[i] / (float)texBytes(texs[i].w, texs[i].h);
         if (sc > bestScore) { bestScore = sc; best = i; }
       }
       if (best < 0) break;
-      const size_t bytes = (size_t)texs[best].w * texs[best].h * 2;
+      const size_t bytes = texBytes(texs[best].w, texs[best].h);
       use[best] = 0;                                   // não tenta de novo, caiba ou não
       uint16_t* q = (uint16_t*)moveInternal(texs[best].data, bytes);
       if (q != texs[best].data) { texs[best].data = q; ++moved; movedBytes += bytes; }
@@ -5782,6 +6066,73 @@ struct Model {
   // o linker põe os literais float DEPOIS do código => "dangerous relocation: l32r: literal placed after use".
   void draw(const Mat4 &MVP, const Target &T) const;
 };
+
+// @@SKIN_OUTCLASS_BEGIN
+// Skinna UM meshlet (só as posições; u,v de vskin ficam). Fora da classe pelo mesmo motivo do draw(): código na IRAM.
+//  - rígido estático: nada a fazer (vskin já tem o bind pose);
+//  - rígido num osso: 1 matriz em registradores p/ o meshlet inteiro, nenhum peso lido;
+//  - misto: por vértice, caminho de 0 / 1 / 2..4 influências (a maioria dos vértices de um personagem tem 1 ou 2).
+void HOT Model::skinMeshlet(int id) {
+  const SkMl& k = skm[id];
+  if (k.rigid && k.bone == 255) { mlVer[id] = poseVer; return; }
+  const Meshlet& s = ml[id];
+  const Vtx* __restrict src = vpool + s.vOff;
+  Vtx* __restrict dst = vskin + s.vOff;
+  const int nv = s.nv;
+  if (k.rigid) {
+    const float* P = pose + 12 * (size_t)k.bone;
+    const float p0 = P[0], p1 = P[1], p2 = P[2],  p3 = P[3];
+    const float p4 = P[4], p5 = P[5], p6 = P[6],  p7 = P[7];
+    const float p8 = P[8], p9 = P[9], p10 = P[10], p11 = P[11];
+    for (int j = 0; j < nv; ++j) {
+      const float x = src[j].x, y = src[j].y, z = src[j].z;
+      dst[j].x = p0*x + p1*y + p2*z  + p3;
+      dst[j].y = p4*x + p5*y + p6*z  + p7;
+      dst[j].z = p8*x + p9*y + p10*z + p11;
+    }
+  } else {
+    const uint8_t* sk = vsk + 8 * (size_t)s.vOff;
+    const float k255 = 1.0f / 255.0f;
+    for (int j = 0; j < nv; ++j, sk += 8) {
+      const float x = src[j].x, y = src[j].y, z = src[j].z;
+      const unsigned w0 = sk[4];
+      if (!w0) { dst[j].x = x; dst[j].y = y; dst[j].z = z; continue; }     // vértice estático
+      const float* P = pose + 12 * (size_t)sk[0];                           // índices de osso já validados em buildSkinInfo
+      float ox, oy, oz;
+      if (w0 == 255) {                                                      // 1 influência: sem multiplicar por peso
+        ox = P[0]*x + P[1]*y + P[2]*z  + P[3];
+        oy = P[4]*x + P[5]*y + P[6]*z  + P[7];
+        oz = P[8]*x + P[9]*y + P[10]*z + P[11];
+      } else if (!sk[6]) {                                                  // 2 influências (caso mais comum em juntas): lerp, sem laço
+        const float* Q = pose + 12 * (size_t)sk[1];                         // pesos somam 255 (normalizeSkinWeights) => w1 = 1 - w0
+        const float w = (float)w0 * k255;
+        const float qx = Q[0]*x + Q[1]*y + Q[2]*z  + Q[3];
+        const float qy = Q[4]*x + Q[5]*y + Q[6]*z  + Q[7];
+        const float qz = Q[8]*x + Q[9]*y + Q[10]*z + Q[11];
+        ox = qx + w * ((P[0]*x + P[1]*y + P[2]*z  + P[3]) - qx);
+        oy = qy + w * ((P[4]*x + P[5]*y + P[6]*z  + P[7]) - qy);
+        oz = qz + w * ((P[8]*x + P[9]*y + P[10]*z + P[11]) - qz);
+      } else {
+        const float w = (float)w0 * k255;
+        ox = w * (P[0]*x + P[1]*y + P[2]*z  + P[3]);
+        oy = w * (P[4]*x + P[5]*y + P[6]*z  + P[7]);
+        oz = w * (P[8]*x + P[9]*y + P[10]*z + P[11]);
+        for (int q = 1; q < 4; ++q) {                                       // pesos nulos já estão compactados no fim
+          const unsigned wt = sk[4 + q];
+          if (!wt) break;
+          const float* Q = pose + 12 * (size_t)sk[q];
+          const float ww = (float)wt * k255;
+          ox += ww * (Q[0]*x + Q[1]*y + Q[2]*z  + Q[3]);
+          oy += ww * (Q[4]*x + Q[5]*y + Q[6]*z  + Q[7]);
+          oz += ww * (Q[8]*x + Q[9]*y + Q[10]*z + Q[11]);
+        }
+      }
+      dst[j].x = ox; dst[j].y = oy; dst[j].z = oz;
+    }
+  }
+  mlVer[id] = poseVer;
+}
+// @@SKIN_OUTCLASS_END
 
 void HOT Model::draw(const Mat4 &MVP, const Target &T) const
   {
@@ -6063,13 +6414,38 @@ static TaskHandle_t gMasterTask = nullptr;
 static TaskHandle_t gWorkerTask = nullptr;
 
 // ---- PROFILER (R3D_PROFILE 1): imprime no Serial, 1x por segundo, onde o tempo de cada quadro 3D vai ----
-#ifndef R3D_PROFILE
-#define R3D_PROFILE 0
-#endif
+// (o valor padrão de R3D_PROFILE é definido UMA vez só, junto das outras opções do rasterizador)
 #if R3D_PROFILE
 static std::atomic<int> gProfBands[2];          // faixas desenhadas por contexto (0 = task Lua, 1 = worker do núcleo 0)
 static uint32_t gProfPrepUs = 0;                // prepare(): frustum + sort dos meshlets (serial, só a task Lua)
 #endif
+
+// ---- fase de SKINNING (antes das faixas) ----
+// Só entram os meshlets VISÍVEIS com vskin velho. Os 2 núcleos pegam blocos de SKIN_CHUNK itens (contador atômico, mesmo
+// balanceamento das faixas); o mestre só libera as faixas quando todos os itens terminaram. O worker age pelo ESTÁGIO, não
+// pela contagem de notificações: uma notificação atrasada/fundida nunca dessincroniza o protocolo.
+#define SKIN_CHUNK 4
+enum { STAGE_IDLE = 0, STAGE_SKIN = 1, STAGE_BANDS = 2 };
+static std::atomic<int> gStage(STAGE_IDLE);
+static std::atomic<int> gSkinNext(1 << 28);   // começa FECHADO (>= qualquer total)
+static std::atomic<int> gSkinDone(0);
+static std::atomic<int> gSkinTotal(0);
+static int gSkinOff[R3D_MAX_DRAW + 1];        // prefixo: item k pertence ao modelo j se gSkinOff[j] <= k < gSkinOff[j+1]
+
+static void skinRun() {
+  for (;;) {
+    const int k = gSkinNext.fetch_add(SKIN_CHUNK);
+    const int tot = gSkinTotal.load();
+    if (k >= tot) break;
+    const int kEnd = (k + SKIN_CHUNK < tot) ? (k + SKIN_CHUNK) : tot;
+    int j = 0;
+    for (int it = k; it < kEnd; ++it) {
+      while (gSkinOff[j + 1] <= it) ++j;
+      gJob.model[j]->skinVisible(it - gSkinOff[j]);
+    }
+    gSkinDone.fetch_add(kEnd - k);
+  }
+}
 
 static void renderBands(int ctx) {
   for (;;) {
@@ -6114,7 +6490,16 @@ static void renderBands(int ctx) {
 static void rasterWorker(void*) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    renderBands(1);
+    for (;;) {
+      const int st = gStage.load();
+      if (st == STAGE_SKIN) {
+        skinRun();
+        while (gStage.load() == STAGE_SKIN) { __asm__ __volatile__("nop"); }   // o mestre libera as faixas quando o último bloco acabar
+        continue;
+      }
+      if (st == STAGE_BANDS) renderBands(1);
+      break;                                                                    // STAGE_IDLE: notificação atrasada, nada a fazer
+    }
   }
 }
 #endif
@@ -6383,6 +6768,11 @@ static bool r3dInit(int renderDiv, bool dualCore) {
 #endif
   gR3DReady = true;
   gLastUs = esp_timer_get_time();
+#if R3D_PROFILE
+  Serial.println("[R3D PROF] profiler ON (prints once per second while 3D frames are rendered)");
+#else
+  Serial.println("[R3D PROF] profiler OFF (set R3D_PROFILE to 1)");
+#endif
   Serial.printf("[R3D] ready %dx%d -> %dx%d bands=%d dual=%d async=%d heap=%u psram=%u\n",
                 HR_W, HR_H, SCR_W, SCR_H, RENDER_BANDS, (int)(gWorkerTask != nullptr), (int)gR3DAsync,
                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
@@ -6433,6 +6823,7 @@ static bool r3dQueueModel(Model* m) {
 // Renders queued models into colorBuf[idx], using current camera
 static void r3dRenderTo(uint16_t* color) {
   gMasterTask = xTaskGetCurrentTaskHandle();  // notify must reach the task that waits below
+  gSkinNext.store(1 << 28);                   // fecha a fase de skinning antes de mexer em gJob (worker atrasado não pega nada)
   Mat4 view = camera.getViewMatrix();
   Mat4 proj = perspective(camera.fov, (float)HR_W/(float)HR_H, camera.nearZ, camera.farZ);
   Mat4 VP = matMul(proj, view);
@@ -6456,14 +6847,42 @@ static void r3dRenderTo(uint16_t* color) {
   gProfPrepUs += (uint32_t)(esp_timer_get_time() - tPrep0);
 #endif
 
+  // ---- fase de skinning: vskin dos meshlets visíveis cuja pose mudou (modelo repetido na fila conta uma vez só) ----
+  int skinTot = 0;
+  for (int i = 0; i < n; ++i) {
+    gSkinOff[i] = skinTot;
+    bool dup = false;
+    for (int q = 0; q < i; ++q) if (gJob.model[q] == gJob.model[i]) { dup = true; break; }
+    if (!dup && gJob.model[i]->skinPending > 0) skinTot += gJob.model[i]->visCount;
+  }
+  gSkinOff[n] = skinTot;
+  gSkinTotal.store(skinTot);
+  gSkinDone.store(0);
+  bool workerWoken = false;
+  if (skinTot > 0) {
+    gSkinNext.store(0);                        // abre
+#if RENDER_DUALCORE
+    if (gWorkerTask) {
+      gStage.store(STAGE_SKIN);
+      xTaskNotifyGive(gWorkerTask);
+      workerWoken = true;
+    }
+#endif
+    skinRun();
+    if (workerWoken) while (gSkinDone.load() < skinTot) { __asm__ __volatile__("nop"); }   // espera o bloco que o worker ainda tem na mão
+    gSkinNext.store(1 << 28);
+  }
+
   gBands = gWorkerTask ? RENDER_BANDS : 1;   // publicado antes de liberar o contador
   gBandsDone.store(0);
   gNextBand.store(0);
+  gStage.store(STAGE_BANDS);
 #if RENDER_DUALCORE
-  if (gWorkerTask) xTaskNotifyGive(gWorkerTask);
+  if (gWorkerTask && !workerWoken) xTaskNotifyGive(gWorkerTask);
 #endif
   renderBands(0);
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  gStage.store(STAGE_IDLE);
 }
 
 static void r3dPresent(uint16_t* color) {
@@ -7125,6 +7544,33 @@ int l_Begin3DFrame(lua_State* L) {
   return 0;
 }
 
+#if R3D_PROFILE
+// Acumula 1 quadro (pA = entrada do Render3D, pB = buffer obtido, pC = raster pronto) e imprime 1x por segundo. Vale p/ async e sync.
+static void r3dProfFrame(int64_t pA, int64_t pB, int64_t pC) {
+  static int64_t pEndPrev = 0, pAcc[4] = {0, 0, 0, 0}, pT0 = 0;   // [0] lógica Lua entre quadros, [1] espera de buffer, [2] raster, [3] quadros
+  if (pEndPrev) pAcc[0] += pA - pEndPrev;
+  pAcc[1] += pB - pA; pAcc[2] += pC - pB; pAcc[3]++;
+  pEndPrev = pC;
+  if (!pT0) pT0 = pC;
+  if (pC - pT0 < 1000000) return;
+  const double n = (double)pAcc[3], bw = (double)(gProfBands[0].load() + gProfBands[1].load());
+  Serial.printf("[R3D PROF] %.1f fps | por quadro: lua %.2f ms, espera SPI %.2f ms, raster %.2f ms (prepare %.2f) | worker fez %.0f%% das faixas\n",
+                n * 1e6 / (double)(pC - pT0), pAcc[0] / n / 1000.0, pAcc[1] / n / 1000.0, pAcc[2] / n / 1000.0,
+                (double)gProfPrepUs / n / 1000.0, bw > 0 ? 100.0 * gProfBands[1].load() / bw : 0.0);
+  R3DStats a = {};
+  for (int i = 0; i < 3; ++i) {
+    a.ml += gStat[i].ml; a.frustum += gStat[i].frustum; a.cone += gStat[i].cone; a.model += gStat[i].model;
+    a.hizMl += gStat[i].hizMl; a.hizTri += gStat[i].hizTri; a.hizBuild += gStat[i].hizBuild;
+    a.drawn += gStat[i].drawn; a.small += gStat[i].small;
+  }
+  Serial.printf("[R3D OPT] por quadro: meshlets %.0f | modelo fora %.2f | frustum %.0f | cone %.0f | meshlet-faixas desenhados %.0f, hiz %.0f, pequenos %.0f | tri hiz %.0f | hiz builds %.0f\n",
+                a.ml / n, a.model / n, a.frustum / n, a.cone / n, a.drawn / n, a.hizMl / n, a.small / n, a.hizTri / n, a.hizBuild / n);
+  memset(gStat, 0, sizeof(gStat));
+  pAcc[0] = pAcc[1] = pAcc[2] = pAcc[3] = 0; pT0 = pC; gProfPrepUs = 0;
+  gProfBands[0] = 0; gProfBands[1] = 0;
+}
+#endif
+
 // Render3D(): rasterize all models queued via :draw(), present full-screen via DMA blit
 // Optional: Render3D(false) skips present (leaves pixels in internal buffer)
 int l_Render3D(lua_State* L) {
@@ -7138,9 +7584,7 @@ int l_Render3D(lua_State* L) {
     // rasteriza nele e entrega pra tarefa de blit: o próximo quadro já começa a ser rasterizado durante o envio.
     int idx = 0;
 #if R3D_PROFILE
-    static int64_t pEndPrev = 0, pAcc[4] = {0, 0, 0, 0}, pT0 = 0;   // [0] lógica Lua entre quadros, [1] espera de buffer, [2] raster, [3] quadros
     const int64_t pA = esp_timer_get_time();
-    if (pEndPrev) pAcc[0] += pA - pEndPrev;
 #endif
     xQueueReceive(freeQ, &idx, portMAX_DELAY);
 #if R3D_PROFILE
@@ -7148,30 +7592,7 @@ int l_Render3D(lua_State* L) {
 #endif
     r3dRenderTo(colorBuf[idx]);
 #if R3D_PROFILE
-    const int64_t pC = esp_timer_get_time();
-    pAcc[1] += pB - pA; pAcc[2] += pC - pB; pAcc[3]++;
-    pEndPrev = pC;
-    if (!pT0) pT0 = pC;
-    if (pC - pT0 >= 1000000) {
-      const double n = (double)pAcc[3], bw = (double)(gProfBands[0].load() + gProfBands[1].load());
-      Serial.printf("[R3D PROF] %.1f fps | por quadro: lua %.2f ms, espera SPI %.2f ms, raster %.2f ms (prepare %.2f) | worker fez %.0f%% das faixas\n",
-                    n * 1e6 / (double)(pC - pT0), pAcc[0] / n / 1000.0, pAcc[1] / n / 1000.0, pAcc[2] / n / 1000.0,
-                    (double)gProfPrepUs / n / 1000.0, bw > 0 ? 100.0 * gProfBands[1].load() / bw : 0.0);
-      {
-        R3DStats a = {};
-        for (int i = 0; i < 3; ++i) {
-          a.ml += gStat[i].ml; a.frustum += gStat[i].frustum; a.cone += gStat[i].cone; a.model += gStat[i].model;
-          a.hizMl += gStat[i].hizMl; a.hizTri += gStat[i].hizTri; a.hizBuild += gStat[i].hizBuild;
-          a.drawn += gStat[i].drawn; a.small += gStat[i].small;
-        }
-        // "meshlets" = candidatos no prepare (1x por quadro); "desenhados" e "hiz" contam 1x por faixa (RENDER_BANDS faixas)
-        Serial.printf("[R3D OPT] por quadro: meshlets %.0f | modelo fora %.2f | frustum %.0f | cone %.0f | meshlet-faixas desenhados %.0f, hiz %.0f, pequenos %.0f | tri hiz %.0f | hiz builds %.0f\n",
-                      a.ml / n, a.model / n, a.frustum / n, a.cone / n, a.drawn / n, a.hizMl / n, a.small / n, a.hizTri / n, a.hizBuild / n);
-        memset(gStat, 0, sizeof(gStat));
-      }
-      pAcc[0] = pAcc[1] = pAcc[2] = pAcc[3] = 0; pT0 = pC; gProfPrepUs = 0;
-      gProfBands[0] = 0; gProfBands[1] = 0;
-    }
+    r3dProfFrame(pA, pB, esp_timer_get_time());
 #endif
     gR3DLast = idx;
     if (doPresent) {
@@ -7185,7 +7606,13 @@ int l_Render3D(lua_State* L) {
   }
 
   uint16_t* color = colorBuf[0];
+#if R3D_PROFILE
+  const int64_t pA = esp_timer_get_time();
+#endif
   r3dRenderTo(color);
+#if R3D_PROFILE
+  { const int64_t pC = esp_timer_get_time(); r3dProfFrame(pA, pA, pC); }
+#endif
   gR3DLast = 0;
 
   if (doPresent) {
@@ -7286,6 +7713,18 @@ int l_Render3DSetOpt(lua_State* L) {
   return 1;
 }
 
+// Render3D_SetFilter([maxStep]) -> valor anterior. maxStep = máx. de texels por pixel em que o filtro N64 ainda atua
+// (1.0 = padrão: ampliada até 1:1; 0.5 = só ampliada 2x ou mais, bem mais barato; 0 = filtro desligado). Sem argumento só consulta.
+int l_Render3DSetFilter(lua_State* L) {
+  const float old = (gFiltLim < 0) ? 0.0f : (float)gFiltLim / 65536.0f;
+  if (!lua_isnoneornil(L, 1)) {
+    const float m = (float)luaL_checknumber(L, 1);
+    gFiltLim = (m <= 0.0f) ? -1 : (int32_t)(m * 65536.0f);   // -1: nenhum |du| passa no teste => nunca filtra
+  }
+  lua_pushnumber(L, old);
+  return 1;
+}
+
 void registerR3D(lua_State* L) {
   Serial.println("[R3D] registering Model3D"); Serial.flush();
   registerModel3D(L);
@@ -7295,6 +7734,7 @@ void registerR3D(lua_State* L) {
   lua_register(L, "Begin3DFrame", l_Begin3DFrame);
   lua_register(L, "Render3D", l_Render3D);
   lua_register(L, "Render3D_SetOpt", l_Render3DSetOpt);
+  lua_register(L, "Render3D_SetFilter", l_Render3DSetFilter);
   lua_register(L, "Composite3DToFrame", l_Composite3DToFrame);
 
   lua_register(L, "Camera3D_SetPosition", l_Camera3D_setPosition);
