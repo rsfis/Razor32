@@ -2,7 +2,7 @@
   Fiscion Razor32
 </h1>
 <h3 align="center">
-  A Mini Foldable OldStyle Computer
+  A Mini OldStyle Computer
 </h3>
 
 <h3 align="center">
@@ -17,8 +17,8 @@
 - Foldable Case Easy and Light to Carry
 - USB C charging port
 - Easy to assemble
-- Custom Firmware and OS
-- Runs LUA for Apps
+- Custom Kernelf and OS
+- Runs interpreted LUA for Apps
 - Easy to create your own apps in a Inside IDE and share them within a local network
 
 ## Case
