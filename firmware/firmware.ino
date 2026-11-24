@@ -182,6 +182,8 @@ struct HiZ {
   int tw;              // tiles por linha
   int y0, y1;          // faixa [y0,y1)
   int since;           // meshlets desenhados desde a última reconstrução
+  int refresh;         // intervalo atual de reconstrução (adaptativo, persiste entre quadros: HIZ_REFRESH..HIZ_REFRESH_MAX)
+  int hits;            // meshlets/triângulos ocluídos desde a última reconstrução
   bool valid;
 };
 
@@ -4107,6 +4109,15 @@ static_assert(SPAN_N >= 1 && SPAN_N <= SPAN_FAR, "SPAN_N deve estar entre 1 e SP
 #ifndef COLORB_INTERNAL
 #define COLORB_INTERNAL 1   // 1 = 2º buffer de cor na internal RAM (padrão). 0 = PSRAM: libera ~75 KB internos para promoteTextures()
 #endif                      // (escrita de cor é sequencial = cache da PSRAM perdoa; textura é acesso aleatório = não perdoa). Teste os dois!
+#ifndef MODEL_DEFAULT_CULL
+#define MODEL_DEFAULT_CULL CULL_POS_AREA  // culling de faces padrão dos modelos (CULL_NONE = dupla-face). Se o modelo aparecer "do avesso": setCull("neg")
+#endif
+#ifndef MODEL_SINGLE_SIDED_DEFAULT
+#define MODEL_SINGLE_SIDED_DEFAULT 1      // 1 = ignora o flag "dupla-face" (RZM_DOUBLE) dos meshlets do arquivo. model:setDoubleSided(true) volta a respeitá-lo
+#endif
+#ifndef PROMOTE_TEXTURES
+#define PROMOTE_TEXTURES 0  // 0 = texturas ficam SEMPRE na PSRAM (a internal RAM fica livre). 1 = promove as mais "densas" p/ internal RAM
+#endif
 #ifndef PROMOTE_RESERVE
 #define PROMOTE_RESERVE (56 * 1024)   // internal RAM que SEMPRE sobra depois de promover texturas/arrays por quadro
 #endif
@@ -4139,6 +4150,12 @@ static_assert(SPAN_N >= 1 && SPAN_N <= SPAN_FAR, "SPAN_N deve estar entre 1 e SP
 #define HIZ_REFRESH    16   // reconstrói o Hi-Z a cada N meshlets desenhados (e no começo de cada modelo)
 #endif
 #define HIZ_SHIFT      3    // tile de 8x8 pixels
+#ifndef HIZ_RUN_MIN
+#define HIZ_RUN_MIN    24   // spans com mais de HIZ_RUN_MIN+1 pixels também pulam tiles ocluídos no meio (só com hizSpan)
+#endif
+#ifndef HIZ_REFRESH_MAX
+#define HIZ_REFRESH_MAX 96  // teto do intervalo adaptativo de reconstrução do Hi-Z (cena sem oclusão não paga a varredura)
+#endif
 #define HIZ_MARGIN     3    // folga (em unidades de z de 16 bits) p/ erro de arredondamento de rcpf/interpolação: só oclui com certeza
 #ifndef R3D_PROFILE
 #define R3D_PROFILE 0
@@ -4745,7 +4762,7 @@ static void HOT rasterTri(const Target &T, int fi, int cull, const uint16_t* tda
   st.zd = (uintptr_t)T.depth - (uintptr_t)T.color;
 
   // Hi-Z por linha: apara as pontas do span que caem em tiles onde TODO pixel já é mais perto que o triângulo
-  const HiZ* const hz = (T.hz && gOpt.hizSpan && T.hz->valid) ? T.hz : nullptr;
+  HiZ* const hz = (T.hz && gOpt.hizSpan && T.hz->valid) ? T.hz : nullptr;
 
   for (int y = yStart; y <= yEnd; ++y) {
     const float yc = (float)y + 0.5f;
@@ -4766,9 +4783,31 @@ static void HOT rasterTri(const Target &T, int fi, int cull, const uint16_t* tda
       const float iwB = iwA + diwdx * (float)(xe - xs);
       const int zt = (int)((iwA > iwB ? iwA : iwB) * T.depthScale) + HIZ_MARGIN;
       const uint16_t* hrow = hz->t + (size_t)((y - hz->y0) >> HIZ_SHIFT) * hz->tw;
+      const int oxs = xs, oxe = xe;
       while (xs <= xe && (int)hrow[xs >> HIZ_SHIFT] > zt) xs = ((xs >> HIZ_SHIFT) + 1) << HIZ_SHIFT;
       while (xe >= xs && (int)hrow[xe >> HIZ_SHIFT] > zt) xe = ((xe >> HIZ_SHIFT) << HIZ_SHIFT) - 1;
+      if (xs != oxs || xe != oxe) hz->hits++;      // o Hi-Z está rendendo: mantém o intervalo de reconstrução curto
       if (xe < xs) continue;
+      if (xe - xs >= HIZ_RUN_MIN) {
+        // span longo: pula também os tiles ocluídos no MEIO (ex.: chão atrás de um personagem). Cada trecho visível vira uma chamada
+        // do preenchedor, que recomeça exato no 1º pixel do trecho (u,v,1/w são lineares na tela).
+        const float fyr = yc - y0;
+        int x = xs;
+        while (x <= xe) {
+          if ((int)hrow[x >> HIZ_SHIFT] > zt) { x = ((x >> HIZ_SHIFT) + 1) << HIZ_SHIFT; continue; }
+          int tx = (x >> HIZ_SHIFT) + 1;
+          while ((tx << HIZ_SHIFT) <= xe && (int)hrow[tx] <= zt) ++tx;
+          int e2 = (tx << HIZ_SHIFT) - 1;
+          if (e2 > xe) e2 = xe;
+          const float fxr = ((float)x + 0.5f) - x0;
+          fn(T.color + y * W, x | (e2 << 16),
+             i0 + diwdx*fxr + diwdy*fyr,
+             uw0 + duwdx*fxr + duwdy*fyr,
+             vw0 + dvwdx*fxr + dvwdy*fyr, &st);
+          x = e2 + 1;
+        }
+        continue;
+      }
     }
 
     const float fx = ((float)xs + 0.5f) - x0;
@@ -4812,6 +4851,12 @@ static void HOT hizBuild(const Target& T, HiZ& h) {
       }
     }
   }
+  // intervalo adaptativo: se desde a última varredura nada foi ocluído, ela foi trabalho jogado fora => espaça mais; se ocluiu, aperta
+  if (h.valid) {
+    if (h.hits == 0) { h.refresh += (h.refresh >> 1) + 1; if (h.refresh > HIZ_REFRESH_MAX) h.refresh = HIZ_REFRESH_MAX; }
+    else             { h.refresh -= (h.refresh >> 1);     if (h.refresh < HIZ_REFRESH)     h.refresh = HIZ_REFRESH; }
+  }
+  h.hits = 0;
   h.since = 0;
   h.valid = true;
 }
@@ -4984,6 +5029,9 @@ struct Model {
   int visCount;
   float bc[3] = {0, 0, 0}, bh[3] = {0, 0, 0};   // AABB do modelo inteiro (centro / meia-extensão), união das AABBs dos meshlets
   bool boundsDirty = true;                      // recalcular bc/bh (load, e a cada pose nova em modelos skinned)
+  Model* baseOf = nullptr;                      // instância => modelo-base (a configuração de faces é do MODELO, vale pra todas as instâncias)
+  bool singleSided = MODEL_SINGLE_SIDED_DEFAULT != 0;   // true => ignora RZM_DOUBLE dos meshlets (só o modelo-base guarda o valor)
+  bool ignoreDouble() const { return baseOf ? baseOf->singleSided : singleSided; }
 
   // ---- skinning / animação (só usados se o .rzobj for v4 com esqueleto) ----
   Vtx*      vdraw = nullptr;     // vértices que o draw() lê: vpool (modelo estático) ou vskin (skinned)
@@ -5021,7 +5069,7 @@ struct Model {
   Model()
     : vertCount(0), triCount(0),
       ml(nullptr), vpool(nullptr), tpool(nullptr), mlCount(0),
-      texs(nullptr), texCount(0), cull(CULL_NONE),
+      texs(nullptr), texCount(0), cull(MODEL_DEFAULT_CULL),
       order(nullptr), skey(nullptr), vflag(nullptr), vis(nullptr), visCount(0),
       position({0,0,0}), rotation({0,0,0}), scale({1,1,1})
   {}
@@ -5086,6 +5134,7 @@ struct Model {
     animPlay = false; blending = false; animClip = -1; animT = 0.0f;
     vertCount = 0; triCount = 0;
     isClone = false;
+    baseOf = nullptr;
   }
 
   // Vira uma instância do modelo `s` (que precisa estar carregado e não ser ele mesmo uma instância).
@@ -5093,6 +5142,7 @@ struct Model {
   bool cloneFrom(const Model& s) {
     if (!s.loaded() || s.isClone) return false;
     isClone = true;
+    baseOf = const_cast<Model*>(&s);
     boundsDirty = true;
     vertCount = s.vertCount; triCount = s.triCount; cull = s.cull;
     vpool = s.vpool; tpool = s.tpool; mlCount = s.mlCount; poolV = s.poolV;
@@ -5596,6 +5646,7 @@ struct Model {
     // A câmera é o ponto que o MVP manda p/ x=y=w=0: vetor nulo das linhas X, Y, W (cofactores). O sinal de e[3] carrega a
     // "mão" da projeção (inclui escala negativa/espelho no modelo): área de tela > 0  <=>  sign(e3) * n·(A - câmera) > 0
     // (n = (B-A)x(C-A), A = vértice do triângulo). Verificado numericamente (20 mil triângulos/câmeras/modelos aleatórios).
+    const bool noDbl = ignoreDouble();
     bool coneOn = gOpt.cone && boneCount == 0 && cull != CULL_NONE;
     float eye[3] = { 0, 0, 0 }, coneSgn = 0.0f;
     if (coneOn) {
@@ -5636,7 +5687,7 @@ struct Model {
         const float wc = M[3][0]*s.c[0] + M[3][1]*s.c[1] + M[3][2]*s.c[2] + M[3][3];
         if (farW - wc + (aw0*s.h[0] + aw1*s.h[1] + aw2*s.h[2]) < 0.0f) { R3D_STAT(sp, frustum); vflag[i] = 0; continue; }
       }
-      if (coneOn && s.cc < 255 && !(s.flags & RZM_DOUBLE)) {
+      if (coneOn && s.cc < 255 && (noDbl || !(s.flags & RZM_DOUBLE))) {
         // todas as faces de costas <=> dot(v, eixo) >= corte*|v| + raio   (v = centro - câmera; raio = soma das meias-extensões, >= esfera)
         const float vx = s.c[0] - eye[0], vy = s.c[1] - eye[1], vz = s.c[2] - eye[2];
         const float D = (vx*(float)s.ca[0] + vy*(float)s.ca[1] + vz*(float)s.ca[2]) * coneSgn - (s.h[0] + s.h[1] + s.h[2]) * 1.01f;
@@ -5701,6 +5752,9 @@ struct Model {
   // Move texturas pra internal RAM, das mais "densas" (triângulos que a usam / bytes) pras menos, enquanto
   // sobrar PROMOTE_RESERVE. A cache de dados da PSRAM é pequena; textura em internal RAM não sofre miss.
   void promoteTextures() {
+#if !PROMOTE_TEXTURES
+    return;                       // desligado: texturas permanecem na PSRAM
+#endif
     if (!texs || texCount <= 0 || mlCount <= 0) return;
     uint32_t* use = (uint32_t*)heap_caps_malloc(sizeof(uint32_t) * (size_t)texCount, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!use) return;
@@ -5754,8 +5808,18 @@ void HOT Model::draw(const Mat4 &MVP, const Target &T) const
     R3DStats* const st = T.st;
     (void)st;
     const bool hizTri = hzs && gOpt.hizTri;
+    const bool noDbl = ignoreDouble();
     const bool smallOn = gOpt.smallCull;
-    if (hzs && hzs->since > 0) { hizBuild(T, *hzs); R3D_STAT(st, hizBuild); }
+    if (hzs && hzs->since >= 4) { hizBuild(T, *hzs); R3D_STAT(st, hizBuild); }
+
+    // modelo inteiro atrás do que já foi desenhado nesta faixa (ex.: um cenário/céu atrás de um personagem grande): pula tudo
+    if (hzs && hzs->valid && !boundsDirty) {
+      float mx0, mx1, my0, my1, mw;
+      if (boxRect(M, bc, bh, fW, fH, mx0, mx1, my0, my1, mw) && mw >= nearW) {
+        const int zmax = (int)(rcpf(mw) * T.depthScale) + HIZ_MARGIN;
+        if (hizHidden(*hzs, T.W, mx0, mx1, my0, my1, zmax)) { hzs->hits++; R3D_STAT(st, hizMl); return; }
+      }
+    }
 
     for (int vi = 0; vi < visCount; ++vi) {
       const uint16_t e = vis[vi];
@@ -5771,14 +5835,14 @@ void HOT Model::draw(const Mat4 &MVP, const Target &T) const
       }
 
       // ---- oclusão do meshlet inteiro (Hi-Z) / meshlet minúsculo ----
-      if (hzs && hzs->since >= HIZ_REFRESH) { hizBuild(T, *hzs); R3D_STAT(st, hizBuild); }
+      if (hzs && hzs->since >= hzs->refresh) { hizBuild(T, *hzs); R3D_STAT(st, hizBuild); }
       if ((e & 0x8000) && ((hzs && hzs->valid) || smallOn)) {
         float rx0, rx1, ry0, ry1, wmin;
         if (boxRect(M, s.c, s.h, fW, fH, rx0, rx1, ry0, ry1, wmin)) {
           if (smallOn && (rx1 - rx0) < SMALL_CULL_PX && (ry1 - ry0) < SMALL_CULL_PX) { R3D_STAT(st, small); continue; }
           if (hzs && hzs->valid) {
             const int zmax = (int)(rcpf(wmin) * T.depthScale) + HIZ_MARGIN;   // z do ponto mais perto da caixa
-            if (hizHidden(*hzs, T.W, rx0, rx1, ry0, ry1, zmax)) { R3D_STAT(st, hizMl); continue; }
+            if (hizHidden(*hzs, T.W, rx0, rx1, ry0, ry1, zmax)) { hzs->hits++; R3D_STAT(st, hizMl); continue; }
           }
         }
       }
@@ -5820,7 +5884,7 @@ void HOT Model::draw(const Mat4 &MVP, const Target &T) const
       const int fi = (tex ? 8 : 0) | (rep ? 2 : 0) | (key ? 1 : 0) | ((TEX_FILTER && tex && !key) ? 16 : 0);
       const uint16_t* tdata = tex ? td->data : nullptr;
       const int tw = tex ? td->w : 1, th = tex ? td->h : 1;
-      const int cullMode = (s.flags & RZM_DOUBLE) ? CULL_NONE : cull;
+      const int cullMode = ((s.flags & RZM_DOUBLE) && !noDbl) ? CULL_NONE : cull;
 
       for (int ti = 0; ti < nt; ++ti, tp += 3) {
         const int l0 = tp[0], l1 = tp[1], l2 = tp[2];
@@ -5846,7 +5910,7 @@ void HOT Model::draw(const Mat4 &MVP, const Target &T) const
             const float mny = min3f(A.y, B.y, C.y), mxy = max3f(A.y, B.y, C.y);
             if ((mxx - mnx) < 32.0f && (mxy - mny) < 32.0f) {
               const int zt = (int)(max3f(A.iw, B.iw, C.iw) * T.depthScale) + HIZ_MARGIN;
-              if (hizHidden(*hzs, T.W, mnx, mxx, mny, mxy, zt)) { R3D_STAT(st, hizTri); continue; }
+              if (hizHidden(*hzs, T.W, mnx, mxx, mny, mxy, zt)) { hzs->hits++; R3D_STAT(st, hizTri); continue; }
             }
           }
           rasterTri(T, fi, CULL_NONE, tdata, tw, th, A, B, C);   // o culling por área já foi feito logo acima
@@ -6029,7 +6093,8 @@ static void renderBands(int ctx) {
     if (gOpt.hiz && gHizMem[ctx]) {       // Hi-Z desta faixa: começa inválido (z-buffer vazio) e só passa a valer depois de ter oclusores
       HiZ& H = gHiz[ctx];
       H.t = gHizMem[ctx]; H.tw = (HR_W + (1 << HIZ_SHIFT) - 1) >> HIZ_SHIFT;
-      H.y0 = T.y0; H.y1 = T.y1; H.since = 0; H.valid = false;
+      H.y0 = T.y0; H.y1 = T.y1; H.since = 0; H.hits = 0; H.valid = false;
+      if (H.refresh < HIZ_REFRESH) H.refresh = HIZ_REFRESH;   // adaptativo: persiste entre quadros
       T.hz = &H;
     }
 
@@ -6678,6 +6743,19 @@ int l_model3d_setCull(lua_State* L) {
   return 0;
 }
 
+// setDoubleSided(true|false): vale pro MODELO inteiro (base + todas as instâncias, mesmo se chamado numa instância).
+//   false (padrão) = tudo de face única: o culling de setCull() vale pra todos os meshlets, ignorando o flag dupla-face do arquivo.
+//   true           = meshlets que o arquivo marca como dupla-face (folhagem, planos) voltam a ser desenhados dos dois lados.
+// Sem argumento só consulta. Devolve o valor ANTERIOR.
+int l_model3d_setDoubleSided(lua_State* L) {
+  Model* m = checkModelPtr(L, 1);
+  Model* b = m->baseOf ? m->baseOf : m;
+  const bool old = !b->singleSided;
+  if (!lua_isnoneornil(L, 2)) b->singleSided = (lua_toboolean(L, 2) == 0);
+  lua_pushboolean(L, old);
+  return 1;
+}
+
 int l_model3d_playAnim(lua_State* L) {
   Model* t[R3D_MAX_INSTANCES + 1];
   const int n = model3dTargets(L, 1, t);
@@ -6913,6 +6991,7 @@ void registerModel3D(lua_State* L) {
   lua_pushcfunction(L, l_model3d_setScale);    lua_setfield(L, -2, "setScale");
   lua_pushcfunction(L, l_model3d_getScale);    lua_setfield(L, -2, "getScale");
   lua_pushcfunction(L, l_model3d_setCull);     lua_setfield(L, -2, "setCull");
+  lua_pushcfunction(L, l_model3d_setDoubleSided); lua_setfield(L, -2, "setDoubleSided");
   lua_pushcfunction(L, l_model3d_playAnim);    lua_setfield(L, -2, "playAnim");
   lua_pushcfunction(L, l_model3d_stopAnim);    lua_setfield(L, -2, "stopAnim");
   lua_pushcfunction(L, l_model3d_updateAnim);  lua_setfield(L, -2, "updateAnim");
@@ -7200,7 +7279,7 @@ int l_Render3DSetOpt(lua_State* L) {
   else if (!strcmp(n, "hizspan"))   p = &gOpt.hizSpan;
   else if (!strcmp(n, "farcull"))   p = &gOpt.farCull;
   else if (!strcmp(n, "smallcull")) p = &gOpt.smallCull;
-  else return luaL_error(L, "unknown option '%s' (modelcull, cone, hiz, hiztri, hizspan, farcull, smallcull)", n);
+  else return luaL_error(L, "opcao desconhecida '%s' (modelcull, cone, hiz, hiztri, hizspan, farcull, smallcull)", n);
   const bool old = *p;
   if (!lua_isnoneornil(L, 2)) *p = lua_toboolean(L, 2) != 0;
   lua_pushboolean(L, old);
