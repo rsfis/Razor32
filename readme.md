@@ -17,7 +17,7 @@
 - Foldable Case Easy and Light to Carry
 - USB C charging port
 - Easy to assemble
-- Custom Kernelf and OS
+- Custom Kernel and OS
 - Runs interpreted LUA for Apps
 - Easy to create your own apps in a Inside IDE and share them within a local network
 
