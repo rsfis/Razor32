@@ -2,7 +2,7 @@
   Fiscion Razor32
 </h1>
 <h3 align="center">
-  A Mini Foldable OldStyle Computer
+  A Mini OldStyle Computer
 </h3>
 
 <h3 align="center">
@@ -17,8 +17,8 @@
 - Foldable Case Easy and Light to Carry
 - USB C charging port
 - Easy to assemble
-- Custom Firmware and OS
-- Runs LUA for Apps
+- Custom Kernel and OS
+- Runs interpreted LUA for Apps
 - Easy to create your own apps in a Inside IDE and share them within a local network
 
 ## Case
@@ -63,33 +63,26 @@ Schematic
 |7     |Battery Charger Module and Step Up Conversor|1       |Battery Charger Module and Step Up 3.7v to 5v Conversor                                                       |https://www.mercadolivre.com.br/carregador-bateria-de-litio-5v-2a-conversor-step-up-usb-c/p/MLB2071876811?pdp_filters=item_id:MLB4418035779|$3,42                               |      |USD   |106,59|
 
 ## Keyboard Keys Organization
-q w e r t y u i o p
-
-a s d f g h j k l B
-
-z x c v b S n m f E
-
-
-
-1 2 3 4 5 6 7 8 9 0
-
-+ - % < > ? & ! ( )
-
-/ * = " _ ; . , f Sh
-
-
-
-ESC F1 F2 F3 F4 F5 F6 F7 F8 F9
-
-{    }  @ :  [  ]  
-
-|    \  ' -  HOME
-
+  {
+    {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"},
+    {"A", "S", "D", "F", "G", "H", "J", "K", "L", "RETURN"},
+    {"Z", "X", "C", "V", "SPACE", "B", "N", "M", "FUNCTION", "ENTER"}
+  },
+  {
+    {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"},
+    {"CAPSLOCK", "!", "?", "+", "-", "*", "=", "~", ":", "RETURN"},
+    {"%", "/", "\"", "(", ")", "^", ",", ".", "fun", "ENTER"}
+  },
+  {
+    {"ESC", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9"},
+    {"CAPSLOCK", "@", "$", "", "", "", "WifiToggle", "BluetoothToggle", "", "RETURN"},
+    {"HOME", "", "", "[", "]", "<", ">", "", "fun", "ENTER"}
+  }
 
 ## OS and APPS
 The OS is the RazorOS, made using ArduinoIDE, LovyanGFX and LUA Interpreter.
 
-The OS itself is programmed in C++ using Arduino IDE, with own firmware. The OS has:
+The kernel (the program that manages everything, from bluetooth to keyboard and tasks) is the Razor Kernel, made in C++, and the programs are made in LUA and interpreted by the kernel.
 - Home Page with a Desktop area
 - Control Panel for Rapid Settings
 - Users
@@ -122,7 +115,12 @@ Planned Apps:
 - Terminal Serial
 - Packet Logger
 
-OS and Firmware are still being programmed. For now, RazorOS already has basic drawing and OS functions and Lua VM implemented.
+OS and Firmware are still being programmed. For now, RazorOS already has drawing, OS functions, Wifi, Bluetooth, Mouse support, 3D rendering with R3D (Razor Kernel 3D API) and Lua VM implemented.
+
+## How to make your own apps:
+To make you own APPS, you can do it from the RazorOS, using the text editor, or you can do it on a computer and paste the files on /home/apps/your_app.
+3D objects are converted from a .glb using a tool called glb_to_rzobj.py, with meshes, textures, and skeleton. Take care of the memory!
+The APIs are described on wiki.
 
 ## Cart
 <img width="1565" height="662" alt="jlc" src="https://github.com/user-attachments/assets/0c8c7bd0-e917-4651-b4a3-fb7c22d53816" />
