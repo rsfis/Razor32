@@ -4156,7 +4156,26 @@ static_assert(SPAN_N >= 1 && SPAN_N <= SPAN_FAR, "SPAN_N deve estar entre 1 e SP
 #ifndef TEX_BYTESWAPPED
 #define TEX_BYTESWAPPED 1   // texturas em RGB565 com os bytes trocados (formato do painel, como o buffer de cor). Cores estranhas => 0
 #endif
-static int32_t gFiltLim = (int32_t)(TEXFILTER_MAXSTEP * 65536.0f);   // ajustável em runtime: Render3D_SetFilter(maxStep)
+// ---- filtro PRÉ-CALCULADO (nada de filtro em tempo real) ----
+// No carregamento do modelo: lê a textura original -> gera uma versão (1<<TEX_BAKE_SHIFT)x maior em cada eixo com o bilinear de 3 pontos
+// do N64 já aplicado -> APAGA a original -> o modelo passa a usar SÓ a filtrada (na PSRAM). O raster só faz amostragem por ponto nela
+// (1 leitura por pixel, zero multiplicações de filtro). TEX_FILTER = 0 desliga o bake (texturas originais, amostragem por ponto).
+// Texturas usadas por algum meshlet com color-key NÃO são filtradas (misturaria a cor-chave preta nas bordas): ficam originais.
+#ifndef TEX_BAKE_SHIFT
+#define TEX_BAKE_SHIFT 2    // fator = 1<<SHIFT por eixo (2 => 4x4 sub-amostras por texel, ocupa 16x a textura). 1 = 2x2 (4x), 3 = 8x8 (64x), máx 4
+#endif
+#ifndef TEX_BAKE_MAX_DIM
+#define TEX_BAKE_MAX_DIM 256   // lado máx. (texels) da textura pré-filtrada: textura grande é pouco ampliada, então usa fator menor (menos PSRAM, menos miss de cache)
+#endif
+#ifndef TEX_BAKE_MAX_BYTES
+#define TEX_BAKE_MAX_BYTES (512 * 1024)   // teto por textura pré-filtrada: se passar, tenta fator menor (SHIFT-1 ... 1)
+#endif
+#ifndef TEX_BAKE_PSRAM_RESERVE
+#define TEX_BAKE_PSRAM_RESERVE (1024 * 1024)   // PSRAM que SEMPRE sobra depois de gerar as texturas filtradas (Lua/buffers usam o resto)
+#endif
+static_assert(TEX_BAKE_SHIFT >= 1 && TEX_BAKE_SHIFT <= 4, "TEX_BAKE_SHIFT deve estar entre 1 e 4");
+#define TEX_BAKE_ON TEX_FILTER
+static int32_t gFiltLim = (int32_t)(TEXFILTER_MAXSTEP * 65536.0f);   // SEM EFEITO desde o bake (o filtro não é mais calculado em tempo real); mantido p/ Render3D_SetFilter não quebrar scripts
 #define FILT_LIM gFiltLim
 #ifndef R3D_FPS_OVERLAY
 #define R3D_FPS_OVERLAY 0   // 1 = desenha "FPS:xx.x" no canto do quadro 3D (na tarefa de blit)
@@ -4341,7 +4360,7 @@ struct Meshlet {
   int8_t   ca[3];          // eixo do cone de normais (x127), espaço do modelo
   uint8_t  cc;             // corte do cone x255 (já com folga). 255 = sem cone utilizável (normais muito espalhadas)
 };
-struct TexData { uint16_t* data; int w, h; bool repeat; };
+struct TexData { uint16_t* data; int w, h; bool repeat; uint8_t bs; };   // data = textura FINAL: bs > 0 => já filtrada, (w<<bs) x (h<<bs) texels (a original foi apagada); bs = 0 => original. w,h = dimensões ORIGINAIS (UV)
 
 // @@SKIN_STRUCTS_BEGIN
 // ---- skinning preguiçoso: dados ESTÁTICOS por meshlet (compartilhados entre instâncias) ----
@@ -4721,11 +4740,100 @@ FORCE_INLINE uint16_t texel3c(const uint16_t* __restrict tex, int32_t u, int32_t
   return fxPack(sum);
 }
 
+#if TEX_BAKE_ON
+// ---- BAKE do filtro ----
+// Gera a textura pré-filtrada: (tw<<bs) x (th<<bs) texels, cada um = resultado do bilinear de 3 pontos (texel3c, o MESMO código do filtro em
+// tempo real) amostrado no CENTRO da sub-célula. Texel baixado X cobre u em [X/K, (X+1)/K) (K = 1<<bs), centro u_c = (X + 0.5)/K, e o filtro
+// usa u_c - 0.5 (centro do texel, como no N64) = N/(2K) com N = 2X+1-K. Em ponto fixo 16.16: u = N * 2^(15-bs) (exato p/ bs <= 4), então
+// x0 = N >> (bs+1) e fu (5 bits) saem direto de texel3c. Wrap (REPEAT) / clamp seguem o modo da textura, então as bordas ficam certas.
+// Em tempo real basta amostrar por PONTO em (u >> (16-bs), v >> (16-bs)): ver fillSpan.
+template<bool REP>
+static uint16_t* bakeTex(const uint16_t* tex, int tw, int th, int bs) {
+  const int ftw = tw << bs, fth = th << bs;
+  const size_t bytes = texBytes(ftw, fth);
+  uint16_t* out = (uint16_t*)heap_caps_aligned_alloc(32, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!out) return nullptr;
+  memset(out, 0, bytes);                                   // preenchimento dos blocos 4x4 (nunca lido)
+  const int twm = tw - 1, thm = th - 1;
+  const int tws = REP ? __builtin_ctz((unsigned)tw) : 0, tpr = (tw + 3) >> 2;
+  const int ftws = REP ? tws + bs : 0, ftpr = (ftw + 3) >> 2;
+  const int K = 1 << bs, unit = 1 << (15 - bs);
+  TexCell cell; cell.x0 = cell.y0 = 0x7FFFFFFF;
+  for (int Y = 0; Y < fth; ++Y) {
+    const int32_t v = (int32_t)(2 * Y + 1 - K) * unit;
+    const int ro = texRowOff(Y, ftw, ftws, ftpr, REP);
+    for (int X = 0; X < ftw; ++X) {
+      const int32_t u = (int32_t)(2 * X + 1 - K) * unit;
+      out[ro + texColOff(X)] = texel3c<REP>(tex, u, v, tw, tws, tpr, twm, thm, cell);   // a célula 2x2 é reaproveitada entre sub-texels vizinhos
+    }
+  }
+  return out;
+}
+static uint16_t* bakeFilteredTexture(const uint16_t* tex, int tw, int th, bool rep, int bs) {
+  return rep ? bakeTex<true>(tex, tw, th, bs) : bakeTex<false>(tex, tw, th, bs);
+}
+#endif
+
+// ---- leitura da textura pré-filtrada: um trecho de n pixels (u,v lineares em 16.16 TEXELS ORIGINAIS, du/dv por pixel) ----
+// Por pixel: 1 teste de z + 1 índice + 1 leitura. O que foi tirado do laço quente:
+//  - REPEAT (pot): wrap por máscara e índice do bloco 4x4 só com shifts/ANDs (sem multiplicação: largura em blocos = potência de 2);
+//  - clamp: os extremos do trecho são testados UMA vez; u,v são lineares, então se os 2 extremos cabem na textura todos os pixels cabem
+//    e o laço roda SEM clamp (só trechos que cruzam a borda pagam os 4 comparadores por pixel).
+template<bool REP>
+FORCE_INLINE int bkIndex(int x, int y, int bkws, int bkpr, int bkw) {
+#if TEX_TILED
+  (void)bkw;
+  if (REP) return ((y & ~3) << bkws) + ((y & 3) << 2) + ((x & ~3) << 2) + (x & 3);          // x,y já mascarados; (y>>2)*tpr*16 == (y&~3)<<ws
+  return (((y >> 2) * bkpr) << 4) + ((y & 3) << 2) + ((x >> 2) << 4) + (x & 3);
+#else
+  (void)bkpr;
+  if (REP) return (y << bkws) + x;
+  return y * bkw + x;
+#endif
+}
+template<bool REP>
+FORCE_INLINE void bakedRun(uint16_t* __restrict crow, uint16_t* __restrict zrow, int x, int n, int32_t& z, const int32_t dz,
+                           int32_t u, int32_t v, const int32_t du, const int32_t dv,
+                           const uint16_t* __restrict ftex, int tw, int th, int tws, int fbs)
+{
+  const int bkw = tw << fbs, bkhm = (th << fbs) - 1, bkwm = bkw - 1, bkws = REP ? tws + fbs : 0, bkpr = (bkw + 3) >> 2, sh = 16 - fbs;
+  if (REP) {
+    for (int i = 0; i < n; ++i, ++x) {
+      const int zi = z >> ZFRAC;
+      if (zi >= (int)zrow[x]) {
+        crow[x] = ftex[bkIndex<true>((u >> sh) & bkwm, (v >> sh) & bkhm, bkws, bkpr, bkw)];
+        zrow[x] = (uint16_t)zi;
+      }
+      z += dz; u += du; v += dv;
+    }
+    return;
+  }
+  const int xa = u >> sh, xb = (int)(((int64_t)u + (int64_t)du * (n - 1)) >> sh), ya = v >> sh, yb = (int)(((int64_t)v + (int64_t)dv * (n - 1)) >> sh);   // 64 bits: du grande (minificação) não estoura
+  const int xlo = xa < xb ? xa : xb, xhi = xa < xb ? xb : xa, ylo = ya < yb ? ya : yb, yhi = ya < yb ? yb : ya;
+  if (xlo >= 0 && xhi <= bkwm && ylo >= 0 && yhi <= bkhm) {                                    // trecho inteiro dentro: sem clamp
+    for (int i = 0; i < n; ++i, ++x) {
+      const int zi = z >> ZFRAC;
+      if (zi >= (int)zrow[x]) { crow[x] = ftex[bkIndex<false>(u >> sh, v >> sh, bkws, bkpr, bkw)]; zrow[x] = (uint16_t)zi; }
+      z += dz; u += du; v += dv;
+    }
+    return;
+  }
+  for (int i = 0; i < n; ++i, ++x) {                                                           // cruza a borda: clamp por pixel
+    const int zi = z >> ZFRAC;
+    if (zi >= (int)zrow[x]) {
+      int px = u >> sh, py = v >> sh;
+      px = px < 0 ? 0 : (px > bkwm ? bkwm : px); py = py < 0 ? 0 : (py > bkhm ? bkhm : py);
+      crow[x] = ftex[bkIndex<false>(px, py, bkws, bkpr, bkw)]; zrow[x] = (uint16_t)zi;
+    }
+    z += dz; u += du; v += dv;
+  }
+}
+
 // AFF: uw/vw/duw/dvw já vêm em TEXELS (u,v lineares na tela); senão são u/w, v/w (perspectiva).
-template<bool TEX, bool AFF, bool REP, bool KEY, bool FILT>
+template<bool TEX, bool AFF, bool REP, bool KEY>
 FORCE_INLINE void fillSpan(uint16_t* __restrict crow, uint16_t* __restrict zrow, int xs, int xe,
                      float iw, float diw, float uw, float duw, float vw, float dvw,
-                     const uint16_t* __restrict tex, int tw, int th, float dScale)
+                     const uint16_t* __restrict tex, int tw, int th, float dScale, int fbs)   // fbs: a textura já vem filtrada (tw<<fbs x th<<fbs); 0 = original
 {
   const float zf = dScale * (float)(1 << ZFRAC);
   int32_t z = (int32_t)(iw * zf);
@@ -4743,25 +4851,20 @@ FORCE_INLINE void fillSpan(uint16_t* __restrict crow, uint16_t* __restrict zrow,
   const int twm = tw - 1, thm = th - 1;
   const int tws = REP ? __builtin_ctz((unsigned)tw) : 0;
   const int tpr = (tw + 3) >> 2;          // largura em blocos 4x4 (só usada com TEX_TILED)
+  (void)twm; (void)thm; (void)tpr; (void)fbs;
 
   if (AFF) {
     int32_t u = (int32_t)(uw * 65536.0f), v = (int32_t)(vw * 65536.0f);
     const int32_t du = (int32_t)(duw * 65536.0f), dv = (int32_t)(dvw * 65536.0f);
-    if (FILT && FILT_RUN_OK(xe - xs + 1) && (du < 0 ? -du : du) <= FILT_LIM && (dv < 0 ? -dv : dv) <= FILT_LIM) {   // textura ampliada: filtra
-      TexCell cell; cell.x0 = cell.y0 = 0x7FFFFFFF;
-      u -= 0x8000; v -= 0x8000;                       // centro do texel (1x por span, não por pixel)
-      for (int x = xs; x <= xe; ++x) {
-        const int zi = z >> ZFRAC;
-        if (zi >= (int)zrow[x]) { crow[x] = texel3c<REP>(tex, u, v, tw, tws, tpr, twm, thm, cell); zrow[x] = (uint16_t)zi; }
-        z += dz; u += du; v += dv;
-      }
+    if (!KEY) {   // textura (já filtrada pelo bake): amostragem por ponto, sem nenhum cálculo de filtro
+      bakedRun<REP>(crow, zrow, xs, xe - xs + 1, z, dz, u, v, du, dv, tex, tw, th, tws, fbs);
       return;
     }
-    for (int x = xs; x <= xe; ++x) {
+    for (int x = xs; x <= xe; ++x) {   // color-key: textura original (nunca filtrada)
       const int zi = z >> ZFRAC;
       if (zi >= (int)zrow[x]) {
         const uint16_t c = texel<REP>(tex, u >> 16, v >> 16, tw, tws, tpr, twm, thm);
-        if (!(KEY && c == 0)) { crow[x] = c; zrow[x] = (uint16_t)zi; }
+        if (c != 0) { crow[x] = c; zrow[x] = (uint16_t)zi; }
       }
       z += dz; u += du; v += dv;
     }
@@ -4774,8 +4877,6 @@ FORCE_INLINE void fillSpan(uint16_t* __restrict crow, uint16_t* __restrict zrow,
   float rw = rcpf(iw > 1e-7f ? iw : 1e-7f);
   float ucR = uw * rw, vcR = vw * rw;
   int x = xs;
-  TexCell cell; cell.x0 = cell.y0 = 0x7FFFFFFF;   // 1 cache p/ o span inteiro: o trecho seguinte começa quase sempre na mesma célula (ou numa vizinha)
-  const bool filtOn = FILT && FILT_RUN_OK(xe - xs + 1);
   while (x <= xe) {
     // trecho adaptativo: se 1/w muda menos de ~6% em SPAN_FAR pixels, interpolar u,v linearmente é quase exato
     int n = xe - x + 1;
@@ -4795,19 +4896,15 @@ FORCE_INLINE void fillSpan(uint16_t* __restrict crow, uint16_t* __restrict zrow,
     int32_t u = (int32_t)(uc * 65536.0f), v = (int32_t)(vc * 65536.0f);
     const int32_t du = (int32_t)((un - uc) * inv), dv = (int32_t)((vn - vc) * inv);
 
-    if (filtOn && (du < 0 ? -du : du) <= FILT_LIM && (dv < 0 ? -dv : dv) <= FILT_LIM) {   // este trecho está ampliado: filtra
-      u -= 0x8000; v -= 0x8000;
-      for (int i = 0; i < n; ++i, ++x) {
-        const int zi = z >> ZFRAC;
-        if (zi >= (int)zrow[x]) { crow[x] = texel3c<REP>(tex, u, v, tw, tws, tpr, twm, thm, cell); zrow[x] = (uint16_t)zi; }
-        z += dz; u += du; v += dv;
-      }
+    if (!KEY) {
+      bakedRun<REP>(crow, zrow, x, n, z, dz, u, v, du, dv, tex, tw, th, tws, fbs);
+      x += n;
     } else {
       for (int i = 0; i < n; ++i, ++x) {
         const int zi = z >> ZFRAC;
         if (zi >= (int)zrow[x]) {
           const uint16_t c = texel<REP>(tex, u >> 16, v >> 16, tw, tws, tpr, twm, thm);
-          if (!(KEY && c == 0)) { crow[x] = c; zrow[x] = (uint16_t)zi; }
+          if (c != 0) { crow[x] = c; zrow[x] = (uint16_t)zi; }
         }
         z += dz; u += du; v += dv;
       }
@@ -4819,35 +4916,26 @@ FORCE_INLINE void fillSpan(uint16_t* __restrict crow, uint16_t* __restrict zrow,
 
 // Constantes do triângulo (iguais em todas as linhas) ficam numa struct na pilha do rasterTri: a chamada por linha
 // passa só 6 argumentos (Xtensa: a2..a7), em vez de 14 com 8 deles empilhados e relidos. xs/xe vão empacotados.
-struct SpanTri { float diw, duw, dvw, dScale; const uint16_t* tex; int tw, th; uintptr_t zd; };   // zd = depth - color (bytes, com wrap)
+struct SpanTri { float diw, duw, dvw, dScale; const uint16_t* tex; int tw, th; uintptr_t zd; int fbs; };   // zd = depth - color (bytes, com wrap)
 typedef void (*SpanFn)(uint16_t* crow, int xsxe, float iw, float uw, float vw, const SpanTri* t);
 // índice: bit3 TEX | bit2 AFIM | bit1 REPEAT | bit0 KEY
 #define SPAN_THUNK(F)                                                                                        \
   static void HOT spanThunk##F(uint16_t* c, int xx, float iw, float uw, float vw, const SpanTri* t)          \
-  { fillSpan<((F)&8)!=0,((F)&4)!=0,((F)&2)!=0,((F)&1)!=0,((F)&16)!=0>(c, (uint16_t*)((uintptr_t)c + t->zd),  \
-        xx & 0xFFFF, xx >> 16, iw, t->diw, uw, t->duw, vw, t->dvw, t->tex, t->tw, t->th, t->dScale); }
+  { fillSpan<((F)&8)!=0,((F)&4)!=0,((F)&2)!=0,((F)&1)!=0>(c, (uint16_t*)((uintptr_t)c + t->zd),  \
+        xx & 0xFFFF, xx >> 16, iw, t->diw, uw, t->duw, vw, t->dvw, t->tex, t->tw, t->th, t->dScale, t->fbs); }
 SPAN_THUNK(0)  SPAN_THUNK(8)  SPAN_THUNK(9)  SPAN_THUNK(10) SPAN_THUNK(11)
 SPAN_THUNK(12) SPAN_THUNK(13) SPAN_THUNK(14) SPAN_THUNK(15)
-#if TEX_FILTER
-SPAN_THUNK(24) SPAN_THUNK(26) SPAN_THUNK(28) SPAN_THUNK(30)   // com filtro: só textura (8), sem color-key (bit0 = 0)
-#endif
 
 // sem textura (bit3 = 0) AFIM/REPEAT/KEY são ignorados e rasterTri só gera fi == 0: as entradas 1..7 reaproveitam a variante 0
-// índice: bit4 FILTRO | bit3 TEX | bit2 AFIM | bit1 REPEAT | bit0 KEY.  Com color-key não filtra (misturaria a cor-chave preta nas bordas)
-static const SpanFn SPAN_FNS[32] = {
+// índice: bit3 TEX | bit2 AFIM | bit1 REPEAT | bit0 KEY.  (o filtro já está na própria textura: ver bake no load)
+static const SpanFn SPAN_FNS[16] = {
   spanThunk0,  spanThunk0,  spanThunk0,  spanThunk0,  spanThunk0,  spanThunk0,  spanThunk0,  spanThunk0,
-  spanThunk8,  spanThunk9,  spanThunk10, spanThunk11, spanThunk12, spanThunk13, spanThunk14, spanThunk15,
-  spanThunk0,  spanThunk0,  spanThunk0,  spanThunk0,  spanThunk0,  spanThunk0,  spanThunk0,  spanThunk0,
-#if TEX_FILTER
-  spanThunk24, spanThunk9,  spanThunk26, spanThunk11, spanThunk28, spanThunk13, spanThunk30, spanThunk15
-#else
   spanThunk8,  spanThunk9,  spanThunk10, spanThunk11, spanThunk12, spanThunk13, spanThunk14, spanThunk15
-#endif
 };
 
 // fi: bit3 TEX | bit1 REPEAT | bit0 KEY  (o bit2 AFIM é decidido aqui, por triângulo)
 static void HOT rasterTri(const Target &T, int fi, int cull, const uint16_t* tdata, int tw, int th,
-                      const SV &a, const SV &b, const SV &c)
+                      int fbs, const SV &a, const SV &b, const SV &c)
 {
   const int W = T.W;
   const float fW = (float)W;
@@ -4932,10 +5020,10 @@ static void HOT rasterTri(const Target &T, int fi, int cull, const uint16_t* tda
   const float slopeL  = (xb - xt) * rcpf3(yb - yt);
   const float slopeTM = (ym > yt) ? (xm - xt) * rcpf3(ym - yt) : 0.0f;
   const float slopeMB = (yb > ym) ? (xb - xm) * rcpf3(yb - ym) : 0.0f;
-  const SpanFn fn = SPAN_FNS[fi & 31];
+  const SpanFn fn = SPAN_FNS[fi & 15];
   SpanTri st;
   st.diw = diwdx; st.duw = duwdx; st.dvw = dvwdx; st.dScale = T.depthScale;
-  st.tex = tdata; st.tw = tw; st.th = th;
+  st.tex = tdata; st.tw = tw; st.th = th; st.fbs = fbs;
   st.zd = (uintptr_t)T.depth - (uintptr_t)T.color;
 
   // Hi-Z por linha: apara as pontas do span que caem em tiles onde TODO pixel já é mais perto que o triângulo
@@ -5502,6 +5590,7 @@ struct Model {
         const bool pow2 = te.w && te.h && !(te.w & (te.w - 1)) && !(te.h & (te.h - 1));
         texs[i].w = te.w; texs[i].h = te.h; texs[i].data = nullptr;
         texs[i].repeat = pow2;
+        texs[i].bs = 0;
       }
       texCount = (int)h.texCount;
       for (int i = 0; i < texCount; ++i) {
@@ -5530,6 +5619,36 @@ struct Model {
         if (!texs[i].data || !readAll(f, texs[i].data, lin)) { f.close(); return false; }
 #endif
       }
+#if TEX_BAKE_ON
+      // 2ª passada (depois de TODAS as originais carregadas): original -> gera a versão filtrada -> APAGA a original -> o modelo usa só a filtrada.
+      // Não filtra texturas usadas por meshlet com color-key (ficam originais) nem sem nenhum uso.
+      {
+        size_t bakedBytes = 0, freedBytes = 0; int baked = 0;
+        for (int i = 0; i < texCount; ++i) {
+          TexData& t = texs[i];
+          if (!t.data || t.w <= 0 || t.h <= 0) continue;
+          bool used = false, hasKey = false;
+          for (int m = 0; m < mlCount; ++m) if (ml[m].tex == i) { used = true; if (ml[m].flags & RZM_KEY) { hasKey = true; break; } }
+          if (!used || hasKey) continue;
+          int bs0 = TEX_BAKE_SHIFT;                                  // fator adaptativo: 32x32 -> 4x, 64x64 -> 4x, 128x128 -> 2x ...
+          const int mx = t.w > t.h ? t.w : t.h;
+          while (bs0 > 1 && (mx << bs0) > TEX_BAKE_MAX_DIM) --bs0;
+          bool ok = false;
+          for (int bs = bs0; bs >= 1 && !ok; --bs) {
+            const size_t fb = texBytes(t.w << bs, t.h << bs);
+            if (fb > (size_t)TEX_BAKE_MAX_BYTES) continue;
+            if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < fb + (size_t)TEX_BAKE_PSRAM_RESERVE) continue;
+            uint16_t* nd = bakeFilteredTexture(t.data, t.w, t.h, t.repeat, bs);
+            if (!nd) continue;
+            freedBytes += texBytes(t.w, t.h);
+            heap_caps_free(t.data);                                  // a original some: só existe a filtrada
+            t.data = nd; t.bs = (uint8_t)bs; bakedBytes += fb; ++baked; ok = true;
+          }
+          if (!ok) Serial.printf("  WARN: textura %d (%dx%d) sem PSRAM p/ o filtro pre-calculado: fica original (amostragem por ponto)\n", i, t.w, t.h);
+        }
+        Serial.printf("  texturas filtradas (bake): %d, %u B na PSRAM (originais descartadas: %u B)\n", baked, (unsigned)bakedBytes, (unsigned)freedBytes);
+      }
+#endif
     }
 
     // bloco de skin (ossos, clipes, keyframes): depois das texturas
@@ -6093,14 +6212,16 @@ struct Model {
       int best = -1; float bestScore = 0.0f;
       for (int i = 0; i < texCount; ++i) {
         if (!use[i] || !texs[i].data) continue;
-        const float sc = (float)use[i] / (float)texBytes(texs[i].w, texs[i].h);
+        const size_t hb = texBytes(texs[i].w << texs[i].bs, texs[i].h << texs[i].bs);   // tamanho real (filtrada = maior)
+        const float sc = (float)use[i] / (float)hb;
         if (sc > bestScore) { bestScore = sc; best = i; }
       }
       if (best < 0) break;
-      const size_t bytes = texBytes(texs[best].w, texs[best].h);
+      uint16_t*& blk = texs[best].data;
+      const size_t bytes = texBytes(texs[best].w << texs[best].bs, texs[best].h << texs[best].bs);
       use[best] = 0;                                   // não tenta de novo, caiba ou não
-      uint16_t* q = (uint16_t*)moveInternal(texs[best].data, bytes);
-      if (q != texs[best].data) { texs[best].data = q; ++moved; movedBytes += bytes; }
+      uint16_t* q = (uint16_t*)moveInternal(blk, bytes);
+      if (q != blk) { blk = q; ++moved; movedBytes += bytes; }
     }
     heap_caps_free(use);
     Serial.printf("  texturas em internal RAM: %d de %d (%u B)\n", moved, texCount, (unsigned)movedBytes);
@@ -6276,7 +6397,8 @@ void HOT Model::draw(const Mat4 &MVP, const Target &T) const
       const bool tex = (td && td->data);
       const bool key = tex && (s.flags & RZM_KEY);
       const bool rep = tex && td->repeat;
-      const int fi = (tex ? 8 : 0) | (rep ? 2 : 0) | (key ? 1 : 0) | ((TEX_FILTER && filtering && tex && !key) ? 16 : 0);
+      const int fi = (tex ? 8 : 0) | (rep ? 2 : 0) | (key ? 1 : 0);
+      const int fbs = tex ? (int)td->bs : 0;                   // textura já filtrada pelo bake no load (0 = original)
       const uint16_t* tdata = tex ? td->data : nullptr;
       const int tw = tex ? td->w : 1, th = tex ? td->h : 1;
       const int cullMode = ((s.flags & RZM_DOUBLE) && !noDbl) ? CULL_NONE : cull;
@@ -6308,7 +6430,7 @@ void HOT Model::draw(const Mat4 &MVP, const Target &T) const
               if (hizHidden(*hzs, T.W, mnx, mxx, mny, mxy, zt)) { hzs->hits++; R3D_STAT(st, hizTri); continue; }
             }
           }
-          rasterTri(T, fi, CULL_NONE, tdata, tw, th, A, B, C);   // o culling por área já foi feito logo acima
+          rasterTri(T, fi, CULL_NONE, tdata, tw, th, fbs, A, B, C);   // o culling por área já foi feito logo acima
           continue;
         }
         if (A.iw < 0.0f && B.iw < 0.0f && C.iw < 0.0f) continue;
@@ -6349,7 +6471,7 @@ void HOT Model::draw(const Mat4 &MVP, const Target &T) const
           pv[k].iw = inv; pv[k].u = poly[k].u; pv[k].v = poly[k].v;
         }
         for (int k = 1; k + 1 < n; ++k)
-          rasterTri(T, fi, cullMode, tdata, tw, th, pv[0], pv[k], pv[k + 1]);
+          rasterTri(T, fi, cullMode, tdata, tw, th, fbs, pv[0], pv[k], pv[k + 1]);
       }
     }
   }
@@ -7206,9 +7328,8 @@ int l_model3d_setCull(lua_State* L) {
   return 0;
 }
 
-// SetFiltering(true|false): liga/desliga o filtro de textura (padrão: ligado).
-// Num Model3D com instâncias vale pra TODAS; numa instância (model.instances[i]) vale só pra ela.
-// Não tem efeito se TEX_FILTER = 0, nem em meshlets com color-key (esses nunca são filtrados).
+// SetFiltering(true|false): SEM EFEITO desde o bake. O filtro agora está gravado na própria textura (a original é apagada no load),
+// então não dá mais pra ligar/desligar em tempo real. Mantida só para scripts antigos não quebrarem. Para desligar: TEX_FILTER 0.
 int l_model3d_setFiltering(lua_State* L) {
   Model* t[R3D_MAX_INSTANCES + 1];
   const int n = model3dTargets(L, 1, t);
@@ -7772,8 +7893,8 @@ int l_Render3DSetOpt(lua_State* L) {
   return 1;
 }
 
-// Render3D_SetFilter([maxStep]) -> valor anterior. maxStep = máx. de texels por pixel em que o filtro N64 ainda atua
-// (1.0 = padrão: ampliada até 1:1; 0.5 = só ampliada 2x ou mais, bem mais barato; 0 = filtro desligado). Sem argumento só consulta.
+// Render3D_SetFilter([maxStep]) -> valor anterior. SEM EFEITO desde o bake (o filtro não é mais calculado em tempo real);
+// mantida só para scripts antigos não quebrarem.
 int l_Render3DSetFilter(lua_State* L) {
   const float old = (gFiltLim < 0) ? 0.0f : (float)gFiltLim / 65536.0f;
   if (!lua_isnoneornil(L, 1)) {
