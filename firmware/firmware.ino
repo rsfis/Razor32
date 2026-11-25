@@ -82,6 +82,7 @@
 #define LUA_OS_SET_USER_CONFIG_INTEGER_KEY "OS_SetUserConfigIntegerKey"
 #define LUA_OS_SET_USER_CONFIG_STRING_KEY "OS_SetUserConfigStringKey"
 #define LUA_OS_SET_KEYBOARD_DELAY_DEFINITION "OS_SetKeyboardDelay"
+#define LUA_OS_SET_MAX_FRAMERATE_DEFINITION "OS_SetMaxFramerate"
 #define LUA_OS_GET_PRESSED_KEY_DEFINITION "OS_GetPressedKey"
 #define LUA_OS_IS_KEY_PRESSED_DEFINITION "OS_IsKeyPressed"
 #define LUA_OS_HAS_MOUSE_CONNECTED_DEFINITION "OS_HasMouseConnected"
@@ -1224,8 +1225,50 @@ int l_clearScreen(lua_State* L) {
   return 0;
 }
 
+// ===== LIMITE DE FRAMERATE (OS_SetMaxFramerate) =====
+// 0 = ilimitado (padrão a cada VM Lua nova). Quando > 0, Display_UpdateScreen espera o tempo que faltar
+// pra completar o intervalo mínimo entre dois quadros.
+static volatile uint32_t gFrameIntervalUs = 0;   // 0 = sem limite
+static uint32_t gLastFrameStartUs = 0;
+
+// OS_SetMaxFramerate(frames) - limita os quadros por segundo (frames <= 0 remove o limite)
+int l_OS_SetMaxFramerate(lua_State* L) {
+  lua_Integer fps = luaL_checkinteger(L, 1);
+  if (fps <= 0) {
+    gFrameIntervalUs = 0;
+  } else {
+    if (fps > 1000000) fps = 1000000;
+    uint32_t iv = (uint32_t)(1000000LL / fps);
+    if (iv == 0) iv = 1;
+    gFrameIntervalUs = iv;
+    gLastFrameStartUs = micros() - iv;   // o próximo quadro não espera: só os seguintes são espaçados
+  }
+  return 0;
+}
+
+// Espera (em fatias curtas, pra HOME / OS_StartProgram não ficarem presos) até completar o intervalo do quadro
+static void frameLimitWait(lua_State* L) {
+  const uint32_t iv = gFrameIntervalUs;
+  if (iv == 0) return;
+  for (;;) {
+    const uint32_t el = micros() - gLastFrameStartUs;
+    if (el >= iv) break;
+    const uint32_t left = iv - el;
+    luaSwitchCheck(L);
+    if (left >= 1500) {
+      uint32_t ms = left / 1000;
+      if (ms > 10) ms = 10;
+      vTaskDelay(pdMS_TO_TICKS(ms));
+    } else {
+      delayMicroseconds(left);
+    }
+  }
+  gLastFrameStartUs = micros();
+}
+
 int l_updateScreen(lua_State* L){
   luaSwitchCheck(L);      // HOME / OS_StartProgram pendente: nem envia mais um quadro do programa que está saindo
+  frameLimitWait(L);      // OS_SetMaxFramerate: segura o quadro até completar o intervalo mínimo (no-op se ilimitado)
   flushClear();           // o buffer precisa estar preto fora do que foi desenhado antes de ir pro painel
 
   DirtyList push;
@@ -5156,6 +5199,7 @@ struct Model {
   TexData* texs;
   int texCount;
   int cull;
+  bool filtering = true;   // false => textura deste modelo/instância é amostrada por ponto (sem efeito se TEX_FILTER = 0)
   uint16_t* order;         // meshlets frente -> trás (persistente: insertion sort quase O(n) entre quadros)
   float* skey;             // profundidade de cada meshlet neste quadro
   uint8_t* vflag;          // por meshlet, neste quadro: 0 = fora do frustum, 1 = dentro, 2 = dentro e todo na frente do near
@@ -5290,7 +5334,7 @@ struct Model {
     isClone = true;
     baseOf = const_cast<Model*>(&s);
     boundsDirty = true;
-    vertCount = s.vertCount; triCount = s.triCount; cull = s.cull;
+    vertCount = s.vertCount; triCount = s.triCount; cull = s.cull; filtering = s.filtering;
     vpool = s.vpool; tpool = s.tpool; mlCount = s.mlCount; poolV = s.poolV;
     texs = s.texs; texCount = s.texCount;
     vsk = s.vsk; bones = s.bones; boneCount = s.boneCount;
@@ -6232,7 +6276,7 @@ void HOT Model::draw(const Mat4 &MVP, const Target &T) const
       const bool tex = (td && td->data);
       const bool key = tex && (s.flags & RZM_KEY);
       const bool rep = tex && td->repeat;
-      const int fi = (tex ? 8 : 0) | (rep ? 2 : 0) | (key ? 1 : 0) | ((TEX_FILTER && tex && !key) ? 16 : 0);
+      const int fi = (tex ? 8 : 0) | (rep ? 2 : 0) | (key ? 1 : 0) | ((TEX_FILTER && filtering && tex && !key) ? 16 : 0);
       const uint16_t* tdata = tex ? td->data : nullptr;
       const int tw = tex ? td->w : 1, th = tex ? td->h : 1;
       const int cullMode = ((s.flags & RZM_DOUBLE) && !noDbl) ? CULL_NONE : cull;
@@ -7162,6 +7206,20 @@ int l_model3d_setCull(lua_State* L) {
   return 0;
 }
 
+// SetFiltering(true|false): liga/desliga o filtro de textura (padrão: ligado).
+// Num Model3D com instâncias vale pra TODAS; numa instância (model.instances[i]) vale só pra ela.
+// Não tem efeito se TEX_FILTER = 0, nem em meshlets com color-key (esses nunca são filtrados).
+int l_model3d_setFiltering(lua_State* L) {
+  Model* t[R3D_MAX_INSTANCES + 1];
+  const int n = model3dTargets(L, 1, t);
+  luaL_checktype(L, 2, LUA_TBOOLEAN);
+  const bool on = lua_toboolean(L, 2) != 0;
+  // o modelo-base também guarda o valor: instâncias criadas depois herdam
+  if (!luaL_testudata(L, 1, LUA_MODEL3D_INST_MT)) checkModelPtr(L, 1)->filtering = on;
+  for (int i = 0; i < n; ++i) t[i]->filtering = on;
+  return 0;
+}
+
 // setDoubleSided(true|false): vale pro MODELO inteiro (base + todas as instâncias, mesmo se chamado numa instância).
 //   false (padrão) = tudo de face única: o culling de setCull() vale pra todos os meshlets, ignorando o flag dupla-face do arquivo.
 //   true           = meshlets que o arquivo marca como dupla-face (folhagem, planos) voltam a ser desenhados dos dois lados.
@@ -7411,6 +7469,7 @@ void registerModel3D(lua_State* L) {
   lua_pushcfunction(L, l_model3d_getScale);    lua_setfield(L, -2, "getScale");
   lua_pushcfunction(L, l_model3d_setCull);     lua_setfield(L, -2, "setCull");
   lua_pushcfunction(L, l_model3d_setDoubleSided); lua_setfield(L, -2, "setDoubleSided");
+  lua_pushcfunction(L, l_model3d_setFiltering); lua_setfield(L, -2, "SetFiltering");
   lua_pushcfunction(L, l_model3d_playAnim);    lua_setfield(L, -2, "playAnim");
   lua_pushcfunction(L, l_model3d_stopAnim);    lua_setfield(L, -2, "stopAnim");
   lua_pushcfunction(L, l_model3d_updateAnim);  lua_setfield(L, -2, "updateAnim");
@@ -7794,6 +7853,7 @@ void registerApis(lua_State* L) {
   lua_register(L, LUA_OS_START_PROGRAM_DEFINITION, l_OS_StartProgram);
   lua_register(L, LUA_OS_GET_KERNEL_VERSION_DEFINITION, l_OS_GetKernelVersion);
   lua_register(L, LUA_OS_SET_KEYBOARD_DELAY_DEFINITION, l_OS_SetKeyboardDelay);
+  lua_register(L, LUA_OS_SET_MAX_FRAMERATE_DEFINITION, l_OS_SetMaxFramerate);
   lua_register(L, LUA_OS_GET_PRESSED_KEY_DEFINITION, l_OS_GetPressedKey);
   lua_register(L, LUA_OS_IS_KEY_PRESSED_DEFINITION, l_OS_IsKeyPressed);
   lua_register(L, LUA_OS_SAVE_BIOS_CONFIGURATION_DEFINITION, l_OS_SaveBiosConfig);
@@ -7898,6 +7958,8 @@ static void programUnloadKernelState() {
 // destrói a VM e chama de novo com o novo caminho), false se a task deve terminar.
 static bool runLuaProgram(const char* scriptPath) {
   luaHeapUsed = 0;
+  gFrameIntervalUs = 0;        // cada VM Lua nova começa com framerate ilimitado
+  gLastFrameStartUs = 0;
 
   Serial.println("[LUA] Starting lua_newstate..."); Serial.flush();
   lua_State* L = lua_newstate(lua_psram_alloc, NULL, esp_random());
