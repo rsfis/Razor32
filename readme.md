@@ -132,8 +132,10 @@ The APIs are described on wiki.
 ### How to flash the ESP32:
 - Install ArduinoIDE
 - Install the following libraries:
--- LovyanGFX, by lovyan03
--- ArduinoJSON, by BenoitBlanchon
+   - LovyanGFX, by lovyan03
+   - ArduinoJSON, by BenoitBlanchon
+   - NimBLEDevice
+   - 
 - Install the following Board Managers:
 -- esp32, by Espressif Systems
 -- Select the COM and board 4D Systems gen4-ESP32 Modules (ESP32-S3)
