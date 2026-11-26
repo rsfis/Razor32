@@ -124,7 +124,7 @@
 #define KEY_HOME "HOME"
 #define HOME_PROGRAM_PATH "/sys/src/sys.lua"
 #define HOME_RELOAD_IF_ALREADY_HOME 0   // 1 = HOME reloads sys.lua even if it is already the running program
-#define HOME_FORCE_RESTART_MS 10000      // last resort: stuck Lua program (not calling any API) => esp_restart() (0 = disable)
+#define HOME_FORCE_RESTART_MS 3000      // last resort: stuck Lua program (not calling any API) => esp_restart() (0 = disable)
 #define KB_DEFAULT_DELAY_MS 300         // default keyboard anti-flood delay (OS_SetKeyboardDelay changes it; program switch restores)
 
 // ===== DISPLAY (same display techniques as 3d_models) =====
@@ -4236,7 +4236,7 @@ static int32_t gFiltLim = (int32_t)(TEXFILTER_MAXSTEP * 65536.0f);   // SEM EFEI
 // PROFILER do 3D: 0 = desligado (padrão: zero custo, nada é compilado/impresso). 1 = imprime no Serial 1x por segundo.
 // ESTA é a única definição com valor padrão (antes havia outra, depois, com default 0: a primeira, =1, vencia e o profiler nunca desligava).
 #ifndef R3D_PROFILE
-#define R3D_PROFILE 0   // diagnóstico: agora mede clear e draw separadamente; desligue p/ FPS de produção
+#define R3D_PROFILE 1   // diagnóstico: agora mede clear e draw separadamente; desligue p/ FPS de produção
 #endif
 static_assert(ML_MAXV >= 3 && ML_MAXV <= 255, "ML_MAXV: índices locais são uint8_t");
 static_assert(ML_MAXT >= 1 && ML_MAXT <= 255, "ML_MAXT deve caber em uint8_t");
