@@ -39,7 +39,7 @@
 //X9   47
 //X10  7
 
-#define KERNEL_VERSION "ALPHA 0.2.9"
+#define KERNEL_VERSION "ALPHA 0.5.13"
 
 #define LUA_HEAP_LIMIT (7 * 1024 * 1024)
 // Task stacks live in INTERNAL RAM. The Lua task used to take 48 KB (and the boot animation task another 48 KB for a trivial
