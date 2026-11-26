@@ -63,6 +63,7 @@ Schematic
 |7     |Battery Charger Module and Step Up Conversor|1       |Battery Charger Module and Step Up 3.7v to 5v Conversor                                                       |https://www.mercadolivre.com.br/carregador-bateria-de-litio-5v-2a-conversor-step-up-usb-c/p/MLB2071876811?pdp_filters=item_id:MLB4418035779|$3,42                               |      |USD   |106,59|
 
 ## Keyboard Keys Organization
+```
   {
     {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"},
     {"A", "S", "D", "F", "G", "H", "J", "K", "L", "RETURN"},
@@ -78,6 +79,7 @@ Schematic
     {"CAPSLOCK", "@", "$", "", "", "", "WifiToggle", "BluetoothToggle", "", "RETURN"},
     {"HOME", "", "", "[", "]", "<", ">", "", "fun", "ENTER"}
   }
+```
 
 ## OS and APPS
 The OS is the RazorOS, made using ArduinoIDE, LovyanGFX and LUA Interpreter.
@@ -130,13 +132,14 @@ The APIs are described on wiki.
 ### How to flash the ESP32:
 - Install ArduinoIDE
 - Install the following libraries:
--- LovyanGFX, by lovyan03
--- ArduinoJSON, by BenoitBlanchon
+   - LovyanGFX, by lovyan03
+   - ArduinoJSON, by BenoitBlanchon
+   - NimBLEDevice
 - Install the following Board Managers:
--- esp32, by Espressif Systems
--- Select the COM and board 4D Systems gen4-ESP32 Modules (ESP32-S3)
+  - esp32, by Espressif Systems
+  - Select the COM and board 4D Systems gen4-ESP32 Modules (ESP32-S3)
 ### Extract the files from /firmware/MicroSD Backup.rar
-- Copy the files from /firmware/MicroSD Backup.rar to the microsd root directory
+- Copy the files from /firmware/RazorOS MicroSD Backup.rar to the microsd root directory
 - Insert the micro sd in the MicroSD socket below the screen
 
 Made for: Hackclub FORGE - https://forge.hackclub.com/projects/457
