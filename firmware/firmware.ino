@@ -4103,8 +4103,8 @@ void registerFont(lua_State* L){
 #define R3D_FREE_ON_EXIT 1  // 1 = ao sair do programa 3D, derruba as tasks 3D e devolve z/cores (~225 KB) ao heap
 #define FORCE_PSRAM   0     // 0 = buffers "quentes" (z, cores) tentam internal RAM e caem pra PSRAM sozinhos
                             // 1 = tudo na PSRAM (comportamento antigo, bem mais lento)
-#define SPAN_N        16    // a cada N pixels a textura é corrigida em perspectiva (menor = mais exato, mais lento)
-#define SPAN_FAR      32    // trecho maior, usado quando 1/w varia pouco no trecho (superfícies distantes/frontais)
+#define SPAN_N        32    // corrige perspectiva a cada 32 pixels: menos recíprocos/setup por span
+#define SPAN_FAR      64    // spans longos em superfícies pouco inclinadas (maior velocidade, mais erro UV)
 static_assert(SPAN_N >= 1 && SPAN_N <= SPAN_FAR, "SPAN_N deve estar entre 1 e SPAN_FAR");
 #ifndef RENDER_DUALCORE
 #define RENDER_DUALCORE 1   // 1 = raster dividido entre os 2 núcleos (faixas horizontais); 0 = só o núcleo da task Lua
@@ -4880,7 +4880,9 @@ FORCE_INLINE void fillSpan(uint16_t* __restrict crow, uint16_t* __restrict zrow,
   while (x <= xe) {
     // trecho adaptativo: se 1/w muda menos de ~6% em SPAN_FAR pixels, interpolar u,v linearmente é quase exato
     int n = xe - x + 1;
-    const int lim = (fabsf(diw) * (float)SPAN_FAR < 0.06f * iw) ? SPAN_FAR : SPAN_N;
+    // Aceita variação moderadamente maior de 1/w no span longo. A UV é corrigida
+    // nos endpoints e interpolada em ponto fixo no interior; isto reduz rcpf/setup.
+    const int lim = (fabsf(diw) * (float)SPAN_FAR < 0.08f * iw) ? SPAN_FAR : SPAN_N;
     int steps;
     if (n <= lim) steps = n - 1;        // último trecho: termina no ÚLTIMO pixel (sempre dentro do triângulo)
     else { n = lim; steps = lim; }      // intermediário: termina no 1º pixel do próximo trecho
@@ -4970,11 +4972,16 @@ static void HOT rasterTri(const Target &T, int fi, int cull, const uint16_t* tda
   if (yEnd < yStart) return;
 
   const float invA = rcpf3(area);
+  // Coeficientes geométricos compartilhados: em vez de repetir (delta*edge
+  // +/- delta*edge)*invA para cada atributo, incorpora o inverso da área uma
+  // vez nos quatro coeficientes e usa duas MUL + ADD por gradiente.
+  const float gx1 = by * invA, gx2 = -ay * invA;
+  const float gy1 = -bx * invA, gy2 = ax * invA;
 
   // a.iw/b.iw/c.iw = 1/w já calculado na projeção
   const float i0 = a.iw, i1 = b.iw, i2 = c.iw;
   const float di1 = i1 - i0, di2 = i2 - i0;
-  const float diwdx = (di1*by - di2*ay) * invA, diwdy = (di2*ax - di1*bx) * invA;
+  const float diwdx = di1*gx1 + di2*gx2, diwdy = di1*gy1 + di2*gy2;
 
   float uw0 = 0, vw0 = 0, duwdx = 0, duwdy = 0, dvwdx = 0, dvwdy = 0;
   if (fi & 8) {
@@ -4999,8 +5006,8 @@ static void HOT rasterTri(const Target &T, int fi, int cull, const uint16_t* tda
         }
         if (ok) {
           const float dU1 = U1-U0, dU2 = U2-U0, dV1 = V1-V0, dV2 = V2-V0;
-          duwdx = (dU1*by - dU2*ay) * invA;  duwdy = (dU2*ax - dU1*bx) * invA;
-          dvwdx = (dV1*by - dV2*ay) * invA;  dvwdy = (dV2*ax - dV1*bx) * invA;
+          duwdx = dU1*gx1 + dU2*gx2;  duwdy = dU1*gy1 + dU2*gy2;
+          dvwdx = dV1*gx1 + dV2*gx2;  dvwdy = dV1*gy1 + dV2*gy2;
           uw0 = U0 - oU; vw0 = V0 - oV;
           aff = true;
         }
@@ -5012,8 +5019,9 @@ static void HOT rasterTri(const Target &T, int fi, int cull, const uint16_t* tda
       uw0 = a.u * su * i0; vw0 = a.v * sv * i0;
       const float uw1 = b.u * su * i1, vw1 = b.v * sv * i1;
       const float uw2 = c.u * su * i2, vw2 = c.v * sv * i2;
-      duwdx = ((uw1-uw0)*by - (uw2-uw0)*ay) * invA;  duwdy = ((uw2-uw0)*ax - (uw1-uw0)*bx) * invA;
-      dvwdx = ((vw1-vw0)*by - (vw2-vw0)*ay) * invA;  dvwdy = ((vw2-vw0)*ax - (vw1-vw0)*bx) * invA;
+      const float dU1 = uw1-uw0, dU2 = uw2-uw0, dV1 = vw1-vw0, dV2 = vw2-vw0;
+      duwdx = dU1*gx1 + dU2*gx2;  duwdy = dU1*gy1 + dU2*gy2;
+      dvwdx = dV1*gx1 + dV2*gx2;  dvwdy = dV1*gy1 + dV2*gy2;
     }
   }
 
@@ -5029,10 +5037,26 @@ static void HOT rasterTri(const Target &T, int fi, int cull, const uint16_t* tda
   // Hi-Z por linha: apara as pontas do span que caem em tiles onde TODO pixel já é mais perto que o triângulo
   HiZ* const hz = (T.hz && gOpt.hizSpan && T.hz->valid) ? T.hz : nullptr;
 
-  for (int y = yStart; y <= yEnd; ++y) {
-    const float yc = (float)y + 0.5f;
-    const float xa = xt + slopeL * (yc - yt);
-    const float xe2 = (yc < ym) ? xt + slopeTM * (yc - yt) : xm + slopeMB * (yc - ym);
+  // Edge stepping: calcula as posições iniciais uma única vez e avança por soma
+  // a cada scanline. Evita multiplicações float repetidas por linha.
+  float yc = (float)yStart + 0.5f;
+  const float fyStart = yc - y0;
+  float xLong = xt + slopeL * (yc - yt);
+  float xTopMid = xt + slopeTM * (yc - yt);
+  float xMidBot = xm + slopeMB * (yc - ym);
+
+  // Bases dos atributos no eixo Y, avaliadas em x=x0 e no centro da primeira
+  // scanline. Dentro do loop, avançam por soma; cada span só aplica o delta-X.
+  // Isso elimina duwdy*fy/dvwdy*fy/diwdy*fy de cada chamada de span (inclusive
+  // os sub-spans criados pelo Hi-Z), sem mudar a interpolação linear.
+  float rowIw = i0 + diwdy * fyStart;
+  float rowUw = uw0 + duwdy * fyStart;
+  float rowVw = vw0 + dvwdy * fyStart;
+  for (int y = yStart; y <= yEnd; ++y, yc += 1.0f,
+       xLong += slopeL, xTopMid += slopeTM, xMidBot += slopeMB,
+       rowIw += diwdy, rowUw += duwdy, rowVw += dvwdy) {
+    const float xa = xLong;
+    const float xe2 = (yc < ym) ? xTopMid : xMidBot;
     const float xl = xa < xe2 ? xa : xe2;
     const float xr = xa < xe2 ? xe2 : xa;
 
@@ -5044,7 +5068,7 @@ static void HOT rasterTri(const Target &T, int fi, int cull, const uint16_t* tda
 
     if (hz) {
       // 1/w é linear na linha: o máximo do z do span está numa das pontas
-      const float iwA = i0 + diwdx * (((float)xs + 0.5f) - x0) + diwdy * (yc - y0);
+      const float iwA = rowIw + diwdx * (((float)xs + 0.5f) - x0);
       const float iwB = iwA + diwdx * (float)(xe - xs);
       const int zt = (int)((iwA > iwB ? iwA : iwB) * T.depthScale) + HIZ_MARGIN;
       const uint16_t* hrow = hz->t + (size_t)((y - hz->y0) >> HIZ_SHIFT) * hz->tw;
@@ -5056,7 +5080,6 @@ static void HOT rasterTri(const Target &T, int fi, int cull, const uint16_t* tda
       if (xe - xs >= HIZ_RUN_MIN) {
         // span longo: pula também os tiles ocluídos no MEIO (ex.: chão atrás de um personagem). Cada trecho visível vira uma chamada
         // do preenchedor, que recomeça exato no 1º pixel do trecho (u,v,1/w são lineares na tela).
-        const float fyr = yc - y0;
         int x = xs;
         while (x <= xe) {
           if ((int)hrow[x >> HIZ_SHIFT] > zt) { x = ((x >> HIZ_SHIFT) + 1) << HIZ_SHIFT; continue; }
@@ -5066,9 +5089,9 @@ static void HOT rasterTri(const Target &T, int fi, int cull, const uint16_t* tda
           if (e2 > xe) e2 = xe;
           const float fxr = ((float)x + 0.5f) - x0;
           fn(T.color + y * W, x | (e2 << 16),
-             i0 + diwdx*fxr + diwdy*fyr,
-             uw0 + duwdx*fxr + duwdy*fyr,
-             vw0 + dvwdx*fxr + dvwdy*fyr, &st);
+             rowIw + diwdx*fxr,
+             rowUw + duwdx*fxr,
+             rowVw + dvwdx*fxr, &st);
           x = e2 + 1;
         }
         continue;
@@ -5076,11 +5099,10 @@ static void HOT rasterTri(const Target &T, int fi, int cull, const uint16_t* tda
     }
 
     const float fx = ((float)xs + 0.5f) - x0;
-    const float fy = yc - y0;
     fn(T.color + y * W, xs | (xe << 16),
-       i0 + diwdx*fx + diwdy*fy,
-       uw0 + duwdx*fx + duwdy*fy,
-       vw0 + dvwdx*fx + dvwdy*fy, &st);
+       rowIw + diwdx*fx,
+       rowUw + duwdx*fx,
+       rowVw + dvwdx*fx, &st);
   }
 }
 
@@ -6465,7 +6487,7 @@ void HOT Model::draw(const Mat4 &MVP, const Target &T) const
         if (n < 3) continue;
         SV pv[4];
         for (int k = 0; k < n; ++k) {
-          const float inv = 1.0f / poly[k].w;
+          const float inv = rcpf(poly[k].w);
           pv[k].x = (poly[k].cx * inv * 0.5f + 0.5f) * fW;
           pv[k].y = (0.5f - poly[k].cy * inv * 0.5f) * fH;
           pv[k].iw = inv; pv[k].u = poly[k].u; pv[k].v = poly[k].v;
