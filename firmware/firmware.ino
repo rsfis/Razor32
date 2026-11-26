@@ -124,7 +124,7 @@
 #define KEY_HOME "HOME"
 #define HOME_PROGRAM_PATH "/sys/src/sys.lua"
 #define HOME_RELOAD_IF_ALREADY_HOME 0   // 1 = HOME reloads sys.lua even if it is already the running program
-#define HOME_FORCE_RESTART_MS 3000      // last resort: stuck Lua program (not calling any API) => esp_restart() (0 = disable)
+#define HOME_FORCE_RESTART_MS 10000      // last resort: stuck Lua program (not calling any API) => esp_restart() (0 = disable)
 #define KB_DEFAULT_DELAY_MS 300         // default keyboard anti-flood delay (OS_SetKeyboardDelay changes it; program switch restores)
 
 // ===== DISPLAY (same display techniques as 3d_models) =====
@@ -4103,14 +4103,16 @@ void registerFont(lua_State* L){
 #define R3D_FREE_ON_EXIT 1  // 1 = ao sair do programa 3D, derruba as tasks 3D e devolve z/cores (~225 KB) ao heap
 #define FORCE_PSRAM   0     // 0 = buffers "quentes" (z, cores) tentam internal RAM e caem pra PSRAM sozinhos
                             // 1 = tudo na PSRAM (comportamento antigo, bem mais lento)
-#define SPAN_N        32    // corrige perspectiva a cada 32 pixels: menos recíprocos/setup por span
-#define SPAN_FAR      64    // spans longos em superfícies pouco inclinadas (maior velocidade, mais erro UV)
+#define SPAN_N        64    // spans maiores reduzem setup/recíprocos; UV com aproximação um pouco maior
+#define SPAN_FAR      128    // spans longos em superfícies pouco inclinadas
 static_assert(SPAN_N >= 1 && SPAN_N <= SPAN_FAR, "SPAN_N deve estar entre 1 e SPAN_FAR");
 #ifndef RENDER_DUALCORE
-#define RENDER_DUALCORE 1   // 1 = raster dividido entre os 2 núcleos (faixas horizontais); 0 = só o núcleo da task Lua
+#define RENDER_DUALCORE 0   // raster 3D estritamente sequencial: sem worker/atomic band scheduler
 #endif                      // o worker roda no núcleo 0 com prioridade 1 (abaixo do blit/kernel): só usa a folga que eles deixam
-#define RENDER_BANDS  6     // nº de faixas horizontais por quadro (distribuídas dinamicamente entre os núcleos)
-                            // (com meshlets a duplicação de projeção por faixa é pequena: mais faixas = melhor balanço)
+#ifndef RENDER_BANDS
+#define RENDER_BANDS  1     // single-core: uma faixa, sem duplicar prepare/projeção
+#endif
+                            // (cada faixa reprojeta meshlets; menos faixas reduz trabalho duplicado, mais faixas melhora balanceamento)
 
 // ---- NOVO: otimizações (todas desligáveis pra comparar FPS) ----
 #ifndef AFFINE_TOL
@@ -4137,7 +4139,7 @@ static_assert(SPAN_N >= 1 && SPAN_N <= SPAN_FAR, "SPAN_N deve estar entre 1 e SP
 #endif
 // ---- filtro de textura estilo Nintendo 64 (bilinear de 3 pontos) ----
 #ifndef TEX_TILED
-#define TEX_TILED     1     // 1 = texturas guardadas em blocos 4x4 texels (32 B = 1 linha do cache da PSRAM): amostrar em qualquer direção/rotação
+#define TEX_TILED     0     // 0 = row-major: index simples e melhor locality em UV que varre horizontal; 1 = tiled 4x4 A/B
 #endif                      // toca ~1 linha por 4 pixels em vez de ~1 por pixel (leitura linha-a-linha só é boa se u andar ao longo da linha). 0 = linear (A/B)
 #ifndef TEX_FILTER
 #define TEX_FILTER    1     // 1 = filtra textura AMPLIADA (o "blurzinho" do Ocarina of Time). 0 = amostragem por ponto (original, bit a bit)
@@ -4162,7 +4164,7 @@ static_assert(SPAN_N >= 1 && SPAN_N <= SPAN_FAR, "SPAN_N deve estar entre 1 e SP
 // (1 leitura por pixel, zero multiplicações de filtro). TEX_FILTER = 0 desliga o bake (texturas originais, amostragem por ponto).
 // Texturas usadas por algum meshlet com color-key NÃO são filtradas (misturaria a cor-chave preta nas bordas): ficam originais.
 #ifndef TEX_BAKE_SHIFT
-#define TEX_BAKE_SHIFT 2    // fator = 1<<SHIFT por eixo (2 => 4x4 sub-amostras por texel, ocupa 16x a textura). 1 = 2x2 (4x), 3 = 8x8 (64x), máx 4
+#define TEX_BAKE_SHIFT 1    // fator = 1<<SHIFT por eixo (2 => 4x4 sub-amostras por texel, ocupa 16x a textura). 1 = 2x2 (4x), 2 = 4x4 (16x), 3 = 8x8 (64x), máx 4
 #endif
 #ifndef TEX_BAKE_MAX_DIM
 #define TEX_BAKE_MAX_DIM 256   // lado máx. (texels) da textura pré-filtrada: textura grande é pouco ampliada, então usa fator menor (menos PSRAM, menos miss de cache)
@@ -4190,10 +4192,10 @@ static int32_t gFiltLim = (int32_t)(TEXFILTER_MAXSTEP * 65536.0f);   // SEM EFEI
 #define MODEL_SINGLE_SIDED_DEFAULT 1      // 1 = ignora o flag "dupla-face" (RZM_DOUBLE) dos meshlets do arquivo. model:setDoubleSided(true) volta a respeitá-lo
 #endif
 #ifndef PROMOTE_TEXTURES
-#define PROMOTE_TEXTURES 0  // 0 = texturas ficam SEMPRE na PSRAM (a internal RAM fica livre). 1 = promove as mais "densas" p/ internal RAM
+#define PROMOTE_TEXTURES 1  // promove texturas mais usadas para internal RAM, respeitando PROMOTE_RESERVE
 #endif
 #ifndef PROMOTE_RESERVE
-#define PROMOTE_RESERVE (56 * 1024)   // internal RAM que SEMPRE sobra depois de promover texturas/arrays por quadro
+#define PROMOTE_RESERVE (32 * 1024)   // internal RAM que SEMPRE sobra depois de promover texturas/arrays por quadro
 #endif
 // ---- otimizações de engine 3D: culling e oclusão (todas ligáveis/desligáveis em runtime: Render3D_SetOpt("hiz", false)) ----
 #ifndef OPT_MODEL_CULL
@@ -4206,10 +4208,10 @@ static int32_t gFiltLim = (int32_t)(TEXFILTER_MAXSTEP * 65536.0f);   // SEM EFEI
 #define OPT_HIZ        0    // Hi-Z por faixa: mínimo do z-buffer por tile 8x8, reconstruído no meio do quadro
 #endif
 #ifndef OPT_HIZ_TRI
-#define OPT_HIZ_TRI    1    // usa o Hi-Z também por TRIÂNGULO (antes de montar gradientes / rasterizar)
+#define OPT_HIZ_TRI    0    // Hi-Z desativado: custo de build maior que benefício nesta cena
 #endif
 #ifndef OPT_HIZ_SPAN
-#define OPT_HIZ_SPAN   1    // usa o Hi-Z por LINHA: apara as pontas de cada span que caem em tiles ocluídos
+#define OPT_HIZ_SPAN   0    // Hi-Z desativado: raster sequencial sem testes por tile
 #endif
 #ifndef OPT_FAR_CULL
 #define OPT_FAR_CULL   0    // plano far (camera.farZ) por meshlet. DESLIGADO por padrão: um céu grande some se passar do far
@@ -4234,7 +4236,7 @@ static int32_t gFiltLim = (int32_t)(TEXFILTER_MAXSTEP * 65536.0f);   // SEM EFEI
 // PROFILER do 3D: 0 = desligado (padrão: zero custo, nada é compilado/impresso). 1 = imprime no Serial 1x por segundo.
 // ESTA é a única definição com valor padrão (antes havia outra, depois, com default 0: a primeira, =1, vencia e o profiler nunca desligava).
 #ifndef R3D_PROFILE
-#define R3D_PROFILE 0
+#define R3D_PROFILE 0   // diagnóstico: agora mede clear e draw separadamente; desligue p/ FPS de produção
 #endif
 static_assert(ML_MAXV >= 3 && ML_MAXV <= 255, "ML_MAXV: índices locais são uint8_t");
 static_assert(ML_MAXT >= 1 && ML_MAXT <= 255, "ML_MAXT deve caber em uint8_t");
@@ -4774,6 +4776,10 @@ static uint16_t* bakeFilteredTexture(const uint16_t* tex, int tw, int th, bool r
 }
 #endif
 
+#ifndef BAKED_SAMPLE_CACHE
+#define BAKED_SAMPLE_CACHE 0  // fast path: index direto, sem branches de cache por pixel
+#endif
+
 // ---- leitura da textura pré-filtrada: um trecho de n pixels (u,v lineares em 16.16 TEXELS ORIGINAIS, du/dv por pixel) ----
 // Por pixel: 1 teste de z + 1 índice + 1 leitura. O que foi tirado do laço quente:
 //  - REPEAT (pot): wrap por máscara e índice do bloco 4x4 só com shifts/ANDs (sem multiplicação: largura em blocos = potência de 2);
@@ -4791,42 +4797,98 @@ FORCE_INLINE int bkIndex(int x, int y, int bkws, int bkpr, int bkw) {
   return y * bkw + x;
 #endif
 }
+// Cacheia a base do tile 4x4: UV muda texel quase todo pixel, mas percorre poucos
+// tiles contíguos. O cache evita recalcular a multiplicação/offset do tile a cada texel.
+template<bool REP>
+FORCE_INLINE int bkIndexCached(int x, int y, int bkws, int bkpr, int bkw, int& cacheTileX, int& cacheTileY, int& cacheBase) {
+#if TEX_TILED
+  const int tx = x >> 2, ty = y >> 2;
+  if (tx != cacheTileX || ty != cacheTileY) {
+    cacheBase = ((ty * bkpr + tx) << 4);
+    cacheTileX = tx; cacheTileY = ty;
+  }
+  return cacheBase + ((y & 3) << 2) + (x & 3);
+#else
+  (void)cacheTileX; (void)cacheTileY; (void)cacheBase;
+  return bkIndex<REP>(x, y, bkws, bkpr, bkw);
+#endif
+}
 template<bool REP>
 FORCE_INLINE void bakedRun(uint16_t* __restrict crow, uint16_t* __restrict zrow, int x, int n, int32_t& z, const int32_t dz,
                            int32_t u, int32_t v, const int32_t du, const int32_t dv,
                            const uint16_t* __restrict ftex, int tw, int th, int tws, int fbs)
 {
-  const int bkw = tw << fbs, bkhm = (th << fbs) - 1, bkwm = bkw - 1, bkws = REP ? tws + fbs : 0, bkpr = (bkw + 3) >> 2, sh = 16 - fbs;
+  const int bkw = tw << fbs, bkh = th << fbs;
+  const int bkwm = bkw - 1, bkhm = bkh - 1;
+  const int bkws = REP ? tws + fbs : 0;
+  const int bkpr = (bkw + 3) >> 2;
+  const int sh = 16 - fbs;
+
+  // Z is stored quantized to 16 bits. Comparing the quantized incoming depth
+  // is exactly equivalent to comparing z against (zbuf << ZFRAC), for positive z.
+  // This avoids a 32-bit shift of the stored depth on every pixel.
   if (REP) {
-    for (int i = 0; i < n; ++i, ++x) {
-      const int zi = z >> ZFRAC;
-      if (zi >= (int)zrow[x]) {
-        crow[x] = ftex[bkIndex<true>((u >> sh) & bkwm, (v >> sh) & bkhm, bkws, bkpr, bkw)];
-        zrow[x] = (uint16_t)zi;
-      }
-      z += dz; u += du; v += dv;
+#define R3D_REPEAT_PIXEL() do { \
+      const uint16_t zi = (uint16_t)(z >> ZFRAC); \
+      if (zi >= zrow[x]) { \
+        const int tx = (u >> sh) & bkwm; \
+        const int ty = (v >> sh) & bkhm; \
+        crow[x] = ftex[bkIndex<true>(tx, ty, bkws, bkpr, bkw)]; \
+        zrow[x] = zi; \
+      } \
+      ++x; z += dz; u += du; v += dv; \
+    } while (0)
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+      R3D_REPEAT_PIXEL(); R3D_REPEAT_PIXEL(); R3D_REPEAT_PIXEL(); R3D_REPEAT_PIXEL();
+      R3D_REPEAT_PIXEL(); R3D_REPEAT_PIXEL(); R3D_REPEAT_PIXEL(); R3D_REPEAT_PIXEL();
     }
+    for (; i < n; ++i) R3D_REPEAT_PIXEL();
+#undef R3D_REPEAT_PIXEL
     return;
   }
-  const int xa = u >> sh, xb = (int)(((int64_t)u + (int64_t)du * (n - 1)) >> sh), ya = v >> sh, yb = (int)(((int64_t)v + (int64_t)dv * (n - 1)) >> sh);   // 64 bits: du grande (minificação) não estoura
-  const int xlo = xa < xb ? xa : xb, xhi = xa < xb ? xb : xa, ylo = ya < yb ? ya : yb, yhi = ya < yb ? yb : ya;
-  if (xlo >= 0 && xhi <= bkwm && ylo >= 0 && yhi <= bkhm) {                                    // trecho inteiro dentro: sem clamp
-    for (int i = 0; i < n; ++i, ++x) {
-      const int zi = z >> ZFRAC;
-      if (zi >= (int)zrow[x]) { crow[x] = ftex[bkIndex<false>(u >> sh, v >> sh, bkws, bkpr, bkw)]; zrow[x] = (uint16_t)zi; }
-      z += dz; u += du; v += dv;
+
+  // Clamp path: prove the whole span is inside the texture once. The UVs are
+  // monotonic in each axis across a span, so endpoint bounds are sufficient.
+  const int xa = u >> sh;
+  const int xb = (int)(((int64_t)u + (int64_t)du * (n - 1)) >> sh);
+  const int ya = v >> sh;
+  const int yb = (int)(((int64_t)v + (int64_t)dv * (n - 1)) >> sh);
+  const int xlo = xa < xb ? xa : xb, xhi = xa < xb ? xb : xa;
+  const int ylo = ya < yb ? ya : yb, yhi = ya < yb ? yb : ya;
+
+  if (xlo >= 0 && xhi <= bkwm && ylo >= 0 && yhi <= bkhm) {
+#define R3D_CLAMP_IN_PIXEL() do { \
+      const uint16_t zi = (uint16_t)(z >> ZFRAC); \
+      if (zi >= zrow[x]) { \
+        crow[x] = ftex[bkIndex<false>(u >> sh, v >> sh, bkws, bkpr, bkw)]; \
+        zrow[x] = zi; \
+      } \
+      ++x; z += dz; u += du; v += dv; \
+    } while (0)
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+      R3D_CLAMP_IN_PIXEL(); R3D_CLAMP_IN_PIXEL(); R3D_CLAMP_IN_PIXEL(); R3D_CLAMP_IN_PIXEL();
+      R3D_CLAMP_IN_PIXEL(); R3D_CLAMP_IN_PIXEL(); R3D_CLAMP_IN_PIXEL(); R3D_CLAMP_IN_PIXEL();
     }
+    for (; i < n; ++i) R3D_CLAMP_IN_PIXEL();
+#undef R3D_CLAMP_IN_PIXEL
     return;
   }
-  for (int i = 0; i < n; ++i, ++x) {                                                           // cruza a borda: clamp por pixel
-    const int zi = z >> ZFRAC;
-    if (zi >= (int)zrow[x]) {
-      int px = u >> sh, py = v >> sh;
-      px = px < 0 ? 0 : (px > bkwm ? bkwm : px); py = py < 0 ? 0 : (py > bkhm ? bkhm : py);
-      crow[x] = ftex[bkIndex<false>(px, py, bkws, bkpr, bkw)]; zrow[x] = (uint16_t)zi;
-    }
-    z += dz; u += du; v += dv;
-  }
+
+#define R3D_CLAMP_EDGE_PIXEL() do { \
+    const uint16_t zi = (uint16_t)(z >> ZFRAC); \
+    if (zi >= zrow[x]) { \
+      int tx = u >> sh, ty = v >> sh; \
+      tx = tx < 0 ? 0 : (tx > bkwm ? bkwm : tx); \
+      ty = ty < 0 ? 0 : (ty > bkhm ? bkhm : ty); \
+      crow[x] = ftex[bkIndex<false>(tx, ty, bkws, bkpr, bkw)]; \
+      zrow[x] = zi; \
+    } \
+    ++x; z += dz; u += du; v += dv; \
+  } while (0)
+  for (int i = 0; i < n; ++i) R3D_CLAMP_EDGE_PIXEL();
+#undef R3D_CLAMP_EDGE_PIXEL
 }
 
 // AFF: uw/vw/duw/dvw já vêm em TEXELS (u,v lineares na tela); senão são u/w, v/w (perspectiva).
@@ -4840,11 +4902,21 @@ FORCE_INLINE void fillSpan(uint16_t* __restrict crow, uint16_t* __restrict zrow,
   const int32_t dz = (int32_t)(diw * zf);
 
   if (!TEX) {
-    for (int x = xs; x <= xe; ++x) {
-      const int zi = z >> ZFRAC;
-      if (zi >= (int)zrow[x]) { crow[x] = 0xFFFF; zrow[x] = (uint16_t)zi; }
-      z += dz;
+    int x = xs, n = xe - xs + 1;
+#define ZONLY_PIXEL() do { \
+      const uint16_t zi = (uint16_t)(z >> ZFRAC); \
+      if (zi >= zrow[x]) { \
+        crow[x] = 0xFFFF; zrow[x] = zi; \
+      } \
+      ++x; z += dz; \
+    } while (0)
+    int i = 0;
+    for (; i + 7 < n; i += 8) { \
+      ZONLY_PIXEL(); ZONLY_PIXEL(); ZONLY_PIXEL(); ZONLY_PIXEL(); \
+      ZONLY_PIXEL(); ZONLY_PIXEL(); ZONLY_PIXEL(); ZONLY_PIXEL(); \
     }
+    for (; i < n; ++i) ZONLY_PIXEL();
+#undef ZONLY_PIXEL
     return;
   }
 
@@ -4861,10 +4933,9 @@ FORCE_INLINE void fillSpan(uint16_t* __restrict crow, uint16_t* __restrict zrow,
       return;
     }
     for (int x = xs; x <= xe; ++x) {   // color-key: textura original (nunca filtrada)
-      const int zi = z >> ZFRAC;
-      if (zi >= (int)zrow[x]) {
+      if ((uint16_t)(z >> ZFRAC) >= zrow[x]) {
         const uint16_t c = texel<REP>(tex, u >> 16, v >> 16, tw, tws, tpr, twm, thm);
-        if (c != 0) { crow[x] = c; zrow[x] = (uint16_t)zi; }
+        if (c != 0) { crow[x] = c; zrow[x] = (uint16_t)(z >> ZFRAC); }
       }
       z += dz; u += du; v += dv;
     }
@@ -4937,7 +5008,7 @@ static const SpanFn SPAN_FNS[16] = {
 
 // fi: bit3 TEX | bit1 REPEAT | bit0 KEY  (o bit2 AFIM é decidido aqui, por triângulo)
 static void HOT rasterTri(const Target &T, int fi, int cull, const uint16_t* tdata, int tw, int th,
-                      int fbs, const SV &a, const SV &b, const SV &c)
+                      int fbs, const SV &a, const SV &b, const SV &c, float areaHint, bool areaValid)
 {
   const int W = T.W;
   const float fW = (float)W;
@@ -4953,7 +5024,9 @@ static void HOT rasterTri(const Target &T, int fi, int cull, const uint16_t* tda
   if (ceilToInt(maxy - 0.5f) <= ceilToInt(miny - 0.5f) || ceilToInt(maxx - 0.5f) <= ceilToInt(minx - 0.5f)) return;
 
   const float ax = x1 - x0, ay = y1 - y0, bx = x2 - x0, by = y2 - y0;
-  const float area = ax*by - bx*ay;
+  // Reutiliza a área calculada no draw para backface culling; triângulos clipped
+  // usam vértices novos e calculam a área aqui.
+  const float area = areaValid ? areaHint : (ax*by - bx*ay);
   if (area > -1e-3f && area < 1e-3f) return;
   if (cull == CULL_POS_AREA && area > 0.0f) return;
   if (cull == CULL_NEG_AREA && area < 0.0f) return;
@@ -6326,6 +6399,7 @@ void HOT Model::draw(const Mat4 &MVP, const Target &T) const
     if (visCount <= 0 || !ml) return;
 
     const float fW = (float)T.W, fH = (float)T.H;
+    const float halfW = fW * 0.5f, halfH = fH * 0.5f;
     const float fy0 = (float)T.y0, fy1 = (float)T.y1;
     SV *sv = T.sv;
     uint8_t *oc = T.oc;
@@ -6409,8 +6483,8 @@ void HOT Model::draw(const Mat4 &MVP, const Target &T) const
         SV &o = sv[j];
         if (w < nearW) { o.iw = -1.0f; continue; }
         const float inv = rcpf(w);
-        o.x = (cx * inv * 0.5f + 0.5f) * fW;
-        o.y = (0.5f - cy * inv * 0.5f) * fH;
+        o.x = (cx * inv + 1.0f) * halfW;
+        o.y = (1.0f - cy * inv) * halfH;
         o.iw = inv;                         // 1/w (positivo); -1 = atrás do near
         o.u = p.u; o.v = p.v;
       }
@@ -6437,10 +6511,12 @@ void HOT Model::draw(const Mat4 &MVP, const Target &T) const
         if (A.iw >= 0.0f && B.iw >= 0.0f && C.iw >= 0.0f) {
           // (esq/dir/cima/baixo da tela já foram tratados pelo outcode; falta só a faixa deste núcleo)
           if (max3f(A.y, B.y, C.y) < fy0 || min3f(A.y, B.y, C.y) >= fy1) continue;
-          if (cullMode != CULL_NONE) {
-            const float area = (B.x - A.x) * (C.y - A.y) - (C.x - A.x) * (B.y - A.y);
-            if (cullMode == CULL_POS_AREA && area > 0.0f) continue;
-            if (cullMode == CULL_NEG_AREA && area < 0.0f) continue;
+          float areaHint = 0.0f;
+          const bool areaValid = (cullMode != CULL_NONE);
+          if (areaValid) {
+            areaHint = (B.x - A.x) * (C.y - A.y) - (C.x - A.x) * (B.y - A.y);
+            if (cullMode == CULL_POS_AREA && areaHint > 0.0f) continue;
+            if (cullMode == CULL_NEG_AREA && areaHint < 0.0f) continue;
           }
           if (hizTri && hzs->valid) {
             // Hi-Z por triângulo: se o ponto MAIS PERTO dele (maior 1/w) já está atrás de tudo que cobre os tiles dele, nem monta gradientes.
@@ -6452,7 +6528,7 @@ void HOT Model::draw(const Mat4 &MVP, const Target &T) const
               if (hizHidden(*hzs, T.W, mnx, mxx, mny, mxy, zt)) { hzs->hits++; R3D_STAT(st, hizTri); continue; }
             }
           }
-          rasterTri(T, fi, CULL_NONE, tdata, tw, th, fbs, A, B, C);   // o culling por área já foi feito logo acima
+          rasterTri(T, fi, CULL_NONE, tdata, tw, th, fbs, A, B, C, areaHint, areaValid);
           continue;
         }
         if (A.iw < 0.0f && B.iw < 0.0f && C.iw < 0.0f) continue;
@@ -6488,12 +6564,12 @@ void HOT Model::draw(const Mat4 &MVP, const Target &T) const
         SV pv[4];
         for (int k = 0; k < n; ++k) {
           const float inv = rcpf(poly[k].w);
-          pv[k].x = (poly[k].cx * inv * 0.5f + 0.5f) * fW;
-          pv[k].y = (0.5f - poly[k].cy * inv * 0.5f) * fH;
+          pv[k].x = (poly[k].cx * inv + 1.0f) * halfW;
+          pv[k].y = (1.0f - poly[k].cy * inv) * halfH;
           pv[k].iw = inv; pv[k].u = poly[k].u; pv[k].v = poly[k].v;
         }
         for (int k = 1; k + 1 < n; ++k)
-          rasterTri(T, fi, cullMode, tdata, tw, th, fbs, pv[0], pv[k], pv[k + 1]);
+          rasterTri(T, fi, cullMode, tdata, tw, th, fbs, pv[0], pv[k], pv[k + 1], 0.0f, false);
       }
     }
   }
@@ -6606,6 +6682,7 @@ static TaskHandle_t gWorkerTask = nullptr;
 #if R3D_PROFILE
 static std::atomic<int> gProfBands[2];          // faixas desenhadas por contexto (0 = task Lua, 1 = worker do núcleo 0)
 static uint32_t gProfPrepUs = 0;                // prepare(): frustum + sort dos meshlets (serial, só a task Lua)
+static uint32_t gProfClearUs = 0, gProfDrawUs = 0; // clear framebuffer/z vs desenho dos modelos (single-core)
 #endif
 
 // ---- fase de SKINNING (antes das faixas) ----
@@ -6621,6 +6698,16 @@ static std::atomic<int> gSkinTotal(0);
 static int gSkinOff[R3D_MAX_DRAW + 1];        // prefixo: item k pertence ao modelo j se gSkinOff[j] <= k < gSkinOff[j+1]
 
 static void skinRun() {
+#if !RENDER_DUALCORE
+  // Single-core path: sem atomic fetch-add nem chunking para o worker inexistente.
+  const int tot = gSkinTotal.load();
+  int j = 0;
+  for (int it = 0; it < tot; ++it) {
+    while (gSkinOff[j + 1] <= it) ++j;
+    gJob.model[j]->skinVisible(it - gSkinOff[j]);
+  }
+  gSkinDone.store(tot);
+#else
   for (;;) {
     const int k = gSkinNext.fetch_add(SKIN_CHUNK);
     const int tot = gSkinTotal.load();
@@ -6633,14 +6720,23 @@ static void skinRun() {
     }
     gSkinDone.fetch_add(kEnd - k);
   }
+#endif
 }
 
 static void renderBands(int ctx) {
+#if !RENDER_DUALCORE
+  const int b = 0; // single-core: scheduler/atomics removidos do caminho do frame
+  (void)ctx;
+#if R3D_PROFILE
+  gProfBands[0]++;
+#endif
+#else
   for (;;) {
     const int b = gNextBand.fetch_add(1);
     if (b >= gBands) break;
 #if R3D_PROFILE
     gProfBands[ctx]++;
+#endif
 #endif
 
     // gJob só é lido DEPOIS de reivindicar uma faixa (o mestre publica gJob antes de zerar o contador)
@@ -6662,16 +6758,29 @@ static void renderBands(int ctx) {
       T.hz = &H;
     }
 
-    // limpa só as linhas desta faixa: cor preta e profundidade 0 (= infinito, pois guardamos 1/w)
+    // clear separado no profiler para distinguir banda de memória de fill-rate.
+#if R3D_PROFILE
+    const int64_t tClear0 = esp_timer_get_time();
+#endif
     const size_t off = (size_t)T.y0 * HR_W, cnt = (size_t)(T.y1 - T.y0) * HR_W;
     memset(zBuf + off, 0x00, cnt * 2);
     memset(T.color + off, 0x00, cnt * 2);
-
+#if R3D_PROFILE
+    gProfClearUs += (uint32_t)(esp_timer_get_time() - tClear0);
+    const int64_t tDraw0 = esp_timer_get_time();
+#endif
     // modelos primeiro, céu por último: pixels do céu atrás de um modelo falham no z-test sem amostrar textura
     for (int i = 0; i < gJob.n; ++i) gJob.model[i]->draw(gJob.mvp[i], T);
+#if R3D_PROFILE
+    gProfDrawUs += (uint32_t)(esp_timer_get_time() - tDraw0);
+#endif
 
+#if RENDER_DUALCORE
     if (gBandsDone.fetch_add(1) + 1 == gBands) xTaskNotifyGive(gMasterTask);
   }
+#else
+  (void)b;
+#endif
 }
 
 #if RENDER_DUALCORE
@@ -6921,12 +7030,17 @@ static bool r3dInit(int renderDiv, bool dualCore) {
   colorBuf[0] = (uint16_t*)r3dAllocBuf(total * 2, "r3d color A", R3D_COLORA_RESERVE);
   colorBuf[1] = (uint16_t*)r3dAllocBuf(total * 2, "r3d color B", R3D_INTERNAL_RESERVE);   // 2o quadro: permite o blit assíncrono
   if (!colorBuf[1]) colorBuf[1] = colorBuf[0];   // sem memória: cai no caminho síncrono (1 buffer)
-  {   // Hi-Z: 1 mínimo de z (16 bits) por tile 8x8; no pior caso (1 faixa = quadro inteiro) ~1,3 KB por contexto. Sem memória => Hi-Z desligado
+#if OPT_HIZ
+  {   // Hi-Z somente se explicitamente compilado; padrão OFF para este renderer
     const size_t hizBytes = (size_t)((HR_W + 7) >> HIZ_SHIFT) * (size_t)(((HR_H + 7) >> HIZ_SHIFT) + 1) * 2;
     for (int i = 0; i < 2; ++i) gHizMem[i] = (uint16_t*)heap_caps_malloc(hizBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     Serial.printf("  %-14s %7u B x2 -> %s\n", "r3d hi-z", (unsigned)hizBytes, (gHizMem[0] && gHizMem[1]) ? "internal RAM" : "FALHOU (Hi-Z off)");
     if (!gHizMem[0] || !gHizMem[1]) { for (int i = 0; i < 2; ++i) { if (gHizMem[i]) heap_caps_free(gHizMem[i]); gHizMem[i] = nullptr; } }
   }
+#else
+  gOpt.hiz = gOpt.hizTri = gOpt.hizSpan = false;
+  Serial.println("  r3d hi-z       disabled (no allocation)");
+#endif
   if (!zBuf || !colorBuf[0] || !dmaBuf[0] || !dmaBuf[1]) {
     Serial.println("[R3D] buffer alloc FAILED");
     errf("r3dInit: buffer alloc failed");
@@ -6961,8 +7075,8 @@ static bool r3dInit(int renderDiv, bool dualCore) {
 #else
   Serial.println("[R3D PROF] profiler OFF (set R3D_PROFILE to 1)");
 #endif
-  Serial.printf("[R3D] ready %dx%d -> %dx%d bands=%d dual=%d async=%d heap=%u psram=%u\n",
-                HR_W, HR_H, SCR_W, SCR_H, RENDER_BANDS, (int)(gWorkerTask != nullptr), (int)gR3DAsync,
+  Serial.printf("[R3D] ready %dx%d -> %dx%d bands=%d rasterDual=%d asyncBlit=%d heap=%u psram=%u\n",
+                HR_W, HR_H, SCR_W, SCR_H, 1, (int)(gWorkerTask != nullptr), (int)gR3DAsync,
                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
   return true;
 }
@@ -7069,7 +7183,9 @@ static void r3dRenderTo(uint16_t* color) {
   if (gWorkerTask && !workerWoken) xTaskNotifyGive(gWorkerTask);
 #endif
   renderBands(0);
+#if RENDER_DUALCORE
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+#endif
   gStage.store(STAGE_IDLE);
 }
 
@@ -7662,7 +7778,7 @@ void registerModel3D(lua_State* L) {
 // ---- Camera (singleton exposed as table of functions + optional userdata) ----
 int l_Init3DRenderer(lua_State* L) {
   int div = 2, bands = 6;
-  bool dual = (RENDER_DUALCORE != 0);  // padrão: usa o worker do núcleo 0; Init3DRenderer{dualCore=false} desliga por app
+  bool dual = false;  // single-core fixo: não dividir raster/skinning entre núcleos
   if (lua_istable(L, 1)) {
     lua_getfield(L, 1, "renderDiv"); if (lua_isnumber(L, -1)) div = (int)lua_tointeger(L, -1); lua_pop(L, 1);
     lua_getfield(L, 1, "bands"); if (lua_isnumber(L, -1)) bands = (int)lua_tointeger(L, -1); lua_pop(L, 1);
@@ -7756,9 +7872,10 @@ static void r3dProfFrame(int64_t pA, int64_t pB, int64_t pC) {
   if (!pT0) pT0 = pC;
   if (pC - pT0 < 1000000) return;
   const double n = (double)pAcc[3], bw = (double)(gProfBands[0].load() + gProfBands[1].load());
-  Serial.printf("[R3D PROF] %.1f fps | por quadro: lua %.2f ms, espera SPI %.2f ms, raster %.2f ms (prepare %.2f) | worker fez %.0f%% das faixas\n",
+  Serial.printf("[R3D PROF] %.1f fps | lua %.2f ms, SPI wait %.2f, raster %.2f (prepare %.2f, clear %.2f, draw %.2f) | worker %.0f%%\n",
                 n * 1e6 / (double)(pC - pT0), pAcc[0] / n / 1000.0, pAcc[1] / n / 1000.0, pAcc[2] / n / 1000.0,
-                (double)gProfPrepUs / n / 1000.0, bw > 0 ? 100.0 * gProfBands[1].load() / bw : 0.0);
+                (double)gProfPrepUs / n / 1000.0, (double)gProfClearUs / n / 1000.0, (double)gProfDrawUs / n / 1000.0,
+                bw > 0 ? 100.0 * gProfBands[1].load() / bw : 0.0);
   R3DStats a = {};
   for (int i = 0; i < 3; ++i) {
     a.ml += gStat[i].ml; a.frustum += gStat[i].frustum; a.cone += gStat[i].cone; a.model += gStat[i].model;
@@ -7768,7 +7885,7 @@ static void r3dProfFrame(int64_t pA, int64_t pB, int64_t pC) {
   Serial.printf("[R3D OPT] por quadro: meshlets %.0f | modelo fora %.2f | frustum %.0f | cone %.0f | meshlet-faixas desenhados %.0f, hiz %.0f, pequenos %.0f | tri hiz %.0f | hiz builds %.0f\n",
                 a.ml / n, a.model / n, a.frustum / n, a.cone / n, a.drawn / n, a.hizMl / n, a.small / n, a.hizTri / n, a.hizBuild / n);
   memset(gStat, 0, sizeof(gStat));
-  pAcc[0] = pAcc[1] = pAcc[2] = pAcc[3] = 0; pT0 = pC; gProfPrepUs = 0;
+  pAcc[0] = pAcc[1] = pAcc[2] = pAcc[3] = 0; pT0 = pC; gProfPrepUs = gProfClearUs = gProfDrawUs = 0;
   gProfBands[0] = 0; gProfBands[1] = 0;
 }
 #endif
@@ -7910,7 +8027,13 @@ int l_Render3DSetOpt(lua_State* L) {
   else if (!strcmp(n, "smallcull")) p = &gOpt.smallCull;
   else return luaL_error(L, "opcao desconhecida '%s' (modelcull, cone, hiz, hiztri, hizspan, farcull, smallcull)", n);
   const bool old = *p;
-  if (!lua_isnoneornil(L, 2)) *p = lua_toboolean(L, 2) != 0;
+  if (!lua_isnoneornil(L, 2)) {
+    const bool requested = lua_toboolean(L, 2) != 0;
+    // Hi-Z foi desativado nesta build: o profiler mostrou custo de reconstrução
+    // sem rejeição suficiente. Consultas continuam funcionando; tentar ligar não ativa.
+    if (!strcmp(n, "hiz") || !strcmp(n, "hiztri") || !strcmp(n, "hizspan")) *p = false;
+    else *p = requested;
+  }
   lua_pushboolean(L, old);
   return 1;
 }
