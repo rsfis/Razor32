@@ -135,12 +135,11 @@ The APIs are described on wiki.
    - LovyanGFX, by lovyan03
    - ArduinoJSON, by BenoitBlanchon
    - NimBLEDevice
-   - 
 - Install the following Board Managers:
--- esp32, by Espressif Systems
--- Select the COM and board 4D Systems gen4-ESP32 Modules (ESP32-S3)
+  - esp32, by Espressif Systems
+  - Select the COM and board 4D Systems gen4-ESP32 Modules (ESP32-S3)
 ### Extract the files from /firmware/MicroSD Backup.rar
-- Copy the files from /firmware/MicroSD Backup.rar to the microsd root directory
+- Copy the files from /firmware/RazorOS MicroSD Backup.rar to the microsd root directory
 - Insert the micro sd in the MicroSD socket below the screen
 
 Made for: Hackclub FORGE - https://forge.hackclub.com/projects/457
