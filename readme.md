@@ -142,4 +142,7 @@ The APIs are described on wiki.
 - Copy the files from /firmware/RazorOS MicroSD Backup.rar to the microsd root directory
 - Insert the micro sd in the MicroSD socket below the screen
 
+### How to assemble
+...
+
 Made for: Hackclub FORGE - https://forge.hackclub.com/projects/457
